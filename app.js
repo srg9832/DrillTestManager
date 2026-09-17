@@ -1,0 +1,535 @@
+const CFG = window.CAP_DRILL_CONFIG || {};
+const configured = !!(CFG.supabaseUrl && CFG.supabaseAnonKey && !String(CFG.supabaseAnonKey).includes('PASTE_'));
+const sb = configured ? window.supabase.createClient(CFG.supabaseUrl, CFG.supabaseAnonKey) : null;
+
+let me = null;
+let ctx = null;
+let units = [];
+let activities = [];
+let tests = [];
+let view = 'entry';
+let testId = null;
+let adminTab = 'members';
+let editingRecord = null;
+let dashLimit = 10;
+let reportLimit = 10;
+let recordLimit = 25;
+let statsMode = 'officer';
+const MAX_ROWS = 250;
+
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const dateText = s => s ? new Date(s + 'T00:00:00').toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'}) : '';
+const today = () => new Date().toISOString().slice(0,10);
+
+function toast(message, bad=false){
+  const t = $('#toast');
+  t.textContent = message;
+  t.style.background = bad ? '#852f2f' : '#173a56';
+  t.classList.remove('hidden');
+  clearTimeout(window.__toastTimer);
+  window.__toastTimer = setTimeout(() => t.classList.add('hidden'), 3500);
+}
+function openModal(title, body, foot=''){
+  $('#modalTitle').textContent = title;
+  $('#modalBody').innerHTML = body;
+  $('#modalFoot').innerHTML = foot || '<button class="btn btn-secondary" onclick="closeModal()">Close</button>';
+  $('#modal').showModal();
+}
+function closeModal(){ try { $('#modal').close(); } catch {} }
+function err(e){ console.error(e); toast(e?.message || String(e), true); }
+async function rpc(name, args={}){
+  const {data,error} = await sb.rpc(name,args);
+  if(error) throw error;
+  return data;
+}
+
+function uPerm(id){ return (ctx?.unitPermissions || []).find(p => p.unitId === id); }
+function aPerm(id){ return (ctx?.activityPermissions || []).find(p => p.activityId === id); }
+function canUnit(id, admin=false){
+  const p=uPerm(id);
+  return !!ctx?.appAdmin || (!!p && (admin ? p.unitAdmin : (p.dataEntry || p.unitAdmin)));
+}
+function canActivity(id, admin=false){
+  const p=aPerm(id);
+  return !!ctx?.appAdmin || (!!p && (admin ? p.activityAdmin : (p.dataEntry || p.activityAdmin)));
+}
+function unitAdminIds(){
+  return ctx?.appAdmin ? units.map(u=>u.id) : (ctx?.unitPermissions || []).filter(p=>p.unitAdmin).map(p=>p.unitId);
+}
+function activityAdminIds(){
+  return ctx?.appAdmin ? activities.map(a=>a.id) : (ctx?.activityPermissions || []).filter(p=>p.activityAdmin).map(p=>p.activityId);
+}
+function canAdmin(){
+  return !!ctx && (ctx.appAdmin || ctx.manageActivities || unitAdminIds().length || activityAdminIds().length);
+}
+function scopeLabel(type,id){
+  if(type==='unit'){
+    const x=units.find(u=>u.id===id);
+    return x ? `${x.charter_number || ''} — ${x.name}` : 'Unknown Unit';
+  }
+  const x=activities.find(a=>a.id===id);
+  return x ? `${x.activity_type || 'Activity'} — ${x.name}` : 'Unknown Activity';
+}
+function scopes(){
+  const out=[];
+  if(ctx?.appAdmin){
+    units.filter(x=>x.active).forEach(x=>out.push({type:'unit',id:x.id,label:scopeLabel('unit',x.id)}));
+    activities.filter(x=>x.active).forEach(x=>out.push({type:'activity',id:x.id,label:scopeLabel('activity',x.id)}));
+    return out.sort((a,b)=>a.label.localeCompare(b.label));
+  }
+  (ctx?.unitPermissions || []).filter(p=>p.dataEntry||p.unitAdmin).forEach(p=>{
+    const x=units.find(u=>u.id===p.unitId); if(x?.active) out.push({type:'unit',id:x.id,label:scopeLabel('unit',x.id)});
+  });
+  (ctx?.activityPermissions || []).filter(p=>p.dataEntry||p.activityAdmin).forEach(p=>{
+    const x=activities.find(a=>a.id===p.activityId); if(x?.active) out.push({type:'activity',id:x.id,label:scopeLabel('activity',x.id)});
+  });
+  return out.sort((a,b)=>a.label.localeCompare(b.label));
+}
+function currentScope(){
+  const all=scopes();
+  let type=ctx?.defaultScopeType;
+  let id=type==='unit'?ctx?.defaultUnitId:ctx?.defaultActivityId;
+  if(!all.some(x=>x.type===type&&x.id===id)){ type=all[0]?.type; id=all[0]?.id; }
+  return {type,id};
+}
+
+async function publicSequences(){
+  if(!configured){
+    $('#configWarn').textContent='Before deployment, put your existing Supabase public/anon/publishable key in config.js.';
+    $('#configWarn').classList.remove('hidden');
+    $('#publicSeq').innerHTML='<div class="loading">Waiting for configuration.</div>';
+    return;
+  }
+  const {data,error}=await sb.from('drill_public_sequences').select('*').order('display_order');
+  if(error){ $('#publicSeq').innerHTML=`<div class="alert alert-danger">${esc(error.message)}</div>`; return; }
+  const sel=$('#publicTest');
+  sel.innerHTML=(data||[]).map(x=>`<option value="${x.id}">${esc(x.label)} — ${esc(x.topic)}</option>`).join('');
+  const render=()=>{
+    const t=(data||[]).find(x=>x.id===sel.value);
+    $('#publicSeq').innerHTML=t
+      ? `<div class="public-sequence-meta"><b>${esc(t.label)} — ${esc(t.topic)}</b><br>${esc(t.conditions||'')}</div>${(t.sequence||[]).map(s=>`<div class="public-seq-row ${/^\s*(--|—)/.test(String(s))?'ungraded':''}">${esc(s)}</div>`).join('')}`
+      : '<div class="empty">No active sequences.</div>';
+  };
+  sel.onchange=render; render();
+}
+
+async function login(){
+  try{
+    $('#loginError').classList.add('hidden');
+    if(!configured) throw new Error('Configure config.js first.');
+    const {error}=await sb.auth.signInWithPassword({email:$('#loginEmail').value.trim(),password:$('#loginPassword').value});
+    if(error) throw error;
+  }catch(e){ $('#loginError').textContent=e.message; $('#loginError').classList.remove('hidden'); }
+}
+async function logout(){ if(sb) await sb.auth.signOut(); }
+
+async function loadCore(){
+  const {data:{user}}=await sb.auth.getUser();
+  me=user; if(!user) return;
+  ctx=await rpc('drill_get_my_context');
+  let q=await sb.from('units').select('id,charter_number,name,active').order('charter_number');
+  if(q.error) throw q.error; units=q.data||[];
+  q=await sb.from('drill_activities').select('*').order('start_date',{ascending:false});
+  if(q.error) throw q.error; activities=q.data||[];
+  const td=await sb.from('drill_test_definitions').select('*').order('display_order');
+  if(td.error) throw td.error;
+  const ti=await sb.from('drill_test_items').select('*').eq('active',true).order('item_order');
+  if(ti.error) throw ti.error;
+  tests=(td.data||[]).map(t=>({...t,items:(ti.data||[]).filter(i=>i.test_id===t.id).map(i=>({id:i.item_key,command:i.command,standards:i.standards||[],points:i.points,group:i.group_label||''}))}));
+  if(!tests.some(t=>t.id===testId)) testId=tests.find(t=>t.active)?.id||tests[0]?.id;
+}
+function renderHeader(){
+  const cur=currentScope();
+  $('#appName').textContent=CFG.appName||'CAP Drill Test Manager';
+  $('#userName').textContent=ctx.displayName||me.email;
+  $('#rolePill').textContent=ctx.appAdmin?'Application Admin':unitAdminIds().length?'Unit Admin':ctx.manageActivities?'Activity Manager':'Data Entry';
+  $('#defaultScope').innerHTML=scopes().map(s=>`<option value="${s.type}:${s.id}" ${cur.type===s.type&&cur.id===s.id?'selected':''}>${esc(s.label)}</option>`).join('');
+}
+async function changeScope(v){
+  const [type,id]=v.split(':');
+  try{
+    await rpc('drill_set_user_preference',{p_scope:type,p_id:id});
+    ctx.defaultScopeType=type; ctx.defaultUnitId=type==='unit'?id:null; ctx.defaultActivityId=type==='activity'?id:null;
+    dashLimit=10; reportLimit=10; recordLimit=25; editingRecord=null;
+    renderHeader(); navigate(view);
+  }catch(e){err(e)}
+}
+function renderNav(){
+  const n=[['entry','New Drill Test'],['dashboard','Dashboard'],['records','Records'],['reports','Reports'],['statistics','Statistics']];
+  if(canAdmin()) n.push(['admin','Administration']);
+  $('#mainnav').innerHTML=n.map(([id,l])=>`<button class="navbtn ${view===id?'active':''}" onclick="navigate('${id}')">${l}</button>`).join('');
+}
+function showApp(){
+  $('#loginScreen').classList.add('hidden'); $('#app').classList.remove('hidden');
+  renderHeader(); renderNav(); navigate('entry');
+}
+function navigate(v){
+  view=v; renderNav();
+  if(v!=='entry') editingRecord=null;
+  if(v==='entry') renderEntry();
+  else if(v==='dashboard') renderDashboard();
+  else if(v==='records') renderRecords();
+  else if(v==='reports') renderReports();
+  else if(v==='statistics') renderStatistics();
+  else if(v==='admin') renderAdmin();
+}
+
+function integratedRows(t,existing={}){
+  const by=new Map(t.items.map((x,i)=>[String(x.id),[x,i]])),used=new Set(),rows=[];
+  const graded=(it,idx)=>{
+    if(t.scoring_mode==='points') return `<tr><td class="numcol">${esc(it.id)}</td><td class="command">${esc(it.command)}</td><td>${(it.standards||[]).map(x=>`<div class="standards">${esc(x)}</div>`).join('')}</td><td class="gradecell"><label class="points-check"><input class="scoreInput" data-id="${esc(it.id)}" type="checkbox" ${existing[it.id]===true?'checked':''} onchange="updateScore()"> Earn ${it.points||1} pt</label></td></tr>`;
+    const val=existing[it.id];
+    return `<tr><td class="numcol">${esc(it.id)}</td><td class="command">${esc(it.command)}</td><td>${(it.standards||[]).map(x=>`<div class="standards">${esc(x)}</div>`).join('')}</td><td class="gradecell"><div class="choice-row"><span class="choice"><input class="scoreInput" id="s_${idx}" name="g_${idx}" data-id="${esc(it.id)}" type="radio" value="S" ${val==='S'?'checked':''} onchange="updateScore()"><label class="good" for="s_${idx}">Satisfactory</label></span><span class="choice"><input class="scoreInput" id="u_${idx}" name="g_${idx}" data-id="${esc(it.id)}" type="radio" value="U" ${val==='U'?'checked':''} onchange="updateScore()"><label class="bad" for="u_${idx}">Unsatisfactory</label></span></div></td></tr>`;
+  };
+  const ungraded=line=>{
+    let txt=String(line).replace(/^\s*(--|—)\s*/,'');
+    let note='Sequence / setup command; not graded.';
+    const m=txt.match(/\s*\[([^\]]+)\]\s*$/);
+    if(m){ note=m[1]; txt=txt.slice(0,m.index).trim(); }
+    return `<tr class="ungraded-row"><td class="numcol">--</td><td class="command">${esc(txt)}</td><td>${esc(note)}</td><td><span class="not-graded-label">Not graded</span></td></tr>`;
+  };
+  for(const line of (t.sequence||[])){
+    if(/^\s*(--|—)/.test(String(line))){rows.push(ungraded(line));continue;}
+    const m=String(line).match(/^\s*(\d+)\./);
+    if(m&&by.has(m[1])&&!used.has(m[1])){const [it,i]=by.get(m[1]);rows.push(graded(it,i));used.add(m[1]);}
+  }
+  t.items.forEach((it,i)=>{if(!used.has(String(it.id)))rows.push(graded(it,i));});
+  return rows.join('');
+}
+
+async function renderEntry(){
+  const baseScope=currentScope();
+  const editScope=editingRecord ? {type:editingRecord.evaluation_scope_type,id:editingRecord.evaluation_scope_type==='unit'?editingRecord.evaluation_unit_id:editingRecord.activity_id} : baseScope;
+  if(!editScope.id) return $('#mainContent').innerHTML='<div class="panel"><div class="empty">You do not yet have a Drill unit/activity permission.</div></div>';
+  if(editingRecord && tests.some(x=>x.id===editingRecord.test_definition_id)) testId=editingRecord.test_definition_id;
+  const t=tests.find(x=>x.id===testId)||tests[0];
+  let sug=[];
+  if(editScope.type==='unit') try{sug=await rpc('drill_member_suggestions',{p_unit_id:editScope.id});}catch{}
+  const availableScopes=scopes();
+  if(!availableScopes.some(s=>s.type===editScope.type&&s.id===editScope.id) && editingRecord) availableScopes.push({type:editScope.type,id:editScope.id,label:scopeLabel(editScope.type,editScope.id)});
+  $('#mainContent').innerHTML=`<div class="panel"><h2>${editingRecord?'Edit':'New'} Drill Test</h2>${editingRecord?'<div class="alert alert-warn">You are editing an existing historical record. Changes are audited.</div>':''}<div class="grid grid-3"><div class="field"><label>Evaluation Unit / Activity</label><select id="entryScope">${availableScopes.map(x=>`<option value="${x.type}:${x.id}" ${x.type===editScope.type&&x.id===editScope.id?'selected':''}>${esc(x.label)}</option>`).join('')}</select></div><div class="field"><label>Date</label><input id="entryDate" type="date" value="${esc(editingRecord?.test_date||today())}"></div><div class="field"><label>Testing Officer</label><input id="entryOfficer" value="${esc(editingRecord?.testing_officer_name||ctx.displayName||'')}"></div></div><div class="grid grid-3"><div class="field"><label>CAPID</label><input id="entryCapid" list="capids" inputmode="numeric" value="${esc(editingRecord?.capid_snapshot||'')}"><datalist id="capids">${sug.map(m=>`<option value="${esc(m.capid)}">${esc(m.last_name)}, ${esc(m.first_name)}</option>`).join('')}</datalist><div id="lookupStatus" class="lookup-status"></div></div><div class="field"><label>First Name</label><input id="entryFirst" value="${esc(editingRecord?.first_name_snapshot||'')}" disabled></div><div class="field"><label>Last Name</label><input id="entryLast" value="${esc(editingRecord?.last_name_snapshot||'')}" disabled></div></div><div id="newMember" class="hidden"><div class="grid grid-2"><div class="field"><label>New Cadet Home Unit</label><select id="entryHome">${units.filter(u=>u.active).map(u=>`<option value="${u.id}">${esc(u.charter_number)} — ${esc(u.name)}</option>`).join('')}</select></div><div class="alert alert-info">CAPID was not found. Enter the name and home unit; saving creates the shared member record.</div></div></div><div class="field"><label>Drill Test</label><select id="entryTest">${tests.filter(x=>x.active||x.id===editingRecord?.test_definition_id).map(x=>`<option value="${x.id}" ${x.id===t.id?'selected':''}>${esc(x.label)} — ${esc(x.topic)}</option>`).join('')}</select></div></div><div class="panel" id="scoreArea"></div>`;
+  $('#entryCapid').onblur=lookupMember; $('#entryCapid').onchange=lookupMember;
+  $('#entryTest').onchange=e=>{testId=e.target.value;scorecard();};
+  $('#entryScope').onchange=e=>{ if(editingRecord){ const [ty,id]=e.target.value.split(':'); editingRecord.evaluation_scope_type=ty; editingRecord.evaluation_unit_id=ty==='unit'?id:null; editingRecord.activity_id=ty==='activity'?id:null; } else changeScope(e.target.value); };
+  if(editingRecord) scorecard(editingRecord.results||{}); else scorecard();
+}
+async function lookupMember(){
+  const capid=$('#entryCapid').value.trim(); if(!capid)return;
+  try{
+    const d=await rpc('drill_lookup_member',{p_capid:capid}); const m=Array.isArray(d)?d[0]:d;
+    if(m){
+      $('#entryFirst').value=m.first_name; $('#entryLast').value=m.last_name; $('#entryFirst').disabled=true; $('#entryLast').disabled=true; $('#newMember').classList.add('hidden');
+      $('#lookupStatus').textContent=m.active?'Member found.':'Inactive member found — direct CAPID entry is still allowed.'; $('#lookupStatus').className='lookup-status lookup-ok';
+      if($('#entryHome') && m.home_unit_id) $('#entryHome').value=m.home_unit_id;
+    }else{
+      $('#entryFirst').disabled=false; $('#entryLast').disabled=false; $('#entryFirst').value=''; $('#entryLast').value=''; $('#newMember').classList.remove('hidden');
+      const sc=currentScope(); if(sc.type==='unit'&&$('#entryHome')) $('#entryHome').value=sc.id;
+      $('#lookupStatus').textContent='CAPID not found. Enter name/home unit to create the member.'; $('#lookupStatus').className='lookup-status lookup-warn';
+    }
+  }catch(e){err(e)}
+}
+function scorecard(existing={}){
+  const t=tests.find(x=>x.id===testId); if(!t)return;
+  $('#scoreArea').innerHTML=`<div class="test-summary"><strong>${esc(t.label)} — ${esc(t.topic)}</strong><div class="meta"><div><b>Passing:</b> ${t.pass_required}/${t.max_score}</div><div><b>Source:</b> CAPP 60-34 pp. ${esc(t.source_page||'')}</div><div class="full"><b>Conditions:</b> ${esc(t.conditions||'')}</div></div></div><div class="alert alert-info">Ungraded drill sequence steps appear inline as <b>--</b> and intentionally have no Satisfactory/Unsatisfactory buttons.</div><div class="scorebar"><div><div id="scoreText" class="scorebig"></div><div id="completeText" class="small muted"></div></div><div id="scoreState" class="scorestatus"></div></div><div class="table-wrap"><table class="score-table"><thead><tr><th>#</th><th>Command / Item</th><th>Acceptable Standards / Sequence Note</th><th>Grade</th></tr></thead><tbody>${integratedRows(t,existing)}</tbody></table></div><div class="field"><label>Notes (optional)</label><textarea id="entryNotes">${esc(editingRecord?.notes||'')}</textarea></div><div class="form-actions">${editingRecord?'<button class="btn btn-ghost" onclick="editingRecord=null;navigate(\'records\')">Cancel Edit</button>':''}<button class="btn btn-secondary" onclick="saveRecord('draft')">Save Draft</button><button class="btn btn-primary" onclick="saveRecord('submitted')">Submit Test</button></div>`;
+  updateScore();
+}
+function results(){
+  const t=tests.find(x=>x.id===testId),o={};
+  if(t.scoring_mode==='points') $$('.scoreInput[type=checkbox]').forEach(x=>o[x.dataset.id]=x.checked);
+  else $$('.scoreInput[type=radio]:checked').forEach(x=>o[x.dataset.id]=x.value);
+  return o;
+}
+function score(){
+  const t=tests.find(x=>x.id===testId),r=results();
+  if(t.scoring_mode==='points'){
+    const n=t.items.reduce((s,i)=>s+(r[i.id]?Number(i.points||1):0),0);
+    return {n,done:t.items.length,total:t.items.length,pass:n>=t.pass_required};
+  }
+  const n=t.items.filter(i=>r[i.id]==='S').length,done=t.items.filter(i=>r[i.id]==='S'||r[i.id]==='U').length;
+  return {n,done,total:t.items.length,pass:n>=t.pass_required};
+}
+function updateScore(){
+  const t=tests.find(x=>x.id===testId),s=score(); if(!$('#scoreText'))return;
+  $('#scoreText').textContent=`${s.n} / ${t.max_score}`;
+  $('#completeText').textContent=t.scoring_mode==='points'?`${s.n} points earned`:`${s.done} of ${s.total} graded items scored`;
+  const complete=t.scoring_mode==='points'||s.done===s.total;
+  $('#scoreState').textContent=s.pass?'Passing':complete?'Not Passing':'Incomplete';
+  $('#scoreState').className='scorestatus '+(s.pass?'pass':complete?'fail':'');
+}
+async function saveRecord(status){
+  const capid=$('#entryCapid').value.trim(),t=tests.find(x=>x.id===testId),s=score(),[scopeType,scopeId]=$('#entryScope').value.split(':');
+  if(!capid)return toast('CAPID is required.',true);
+  if(!$('#entryOfficer').value.trim())return toast('Testing Officer is required.',true);
+  if(status==='submitted'&&t.scoring_mode==='su'&&s.done<s.total)return toast('Score every graded item before submitting.',true);
+  try{
+    await rpc('drill_save_record',{p:{recordId:editingRecord?.id||'',scopeType,unitId:scopeType==='unit'?scopeId:'',activityId:scopeType==='activity'?scopeId:'',capid,firstName:$('#entryFirst').value.trim(),lastName:$('#entryLast').value.trim(),homeUnitId:$('#entryHome')?.value||'',testId:t.id,testDate:$('#entryDate').value,testingOfficerName:$('#entryOfficer').value.trim(),testingOfficerUserId:'',status,score:s.n,results:results(),notes:$('#entryNotes').value.trim()}});
+    editingRecord=null; toast(status==='submitted'?'Drill test submitted.':'Draft saved.'); navigate('records');
+  }catch(e){err(e)}
+}
+
+function queryRecords(sc,submitted=false){
+  let q=sb.from('drill_records').select('*',{count:'exact'}).order('test_date',{ascending:false}).order('submitted_at',{ascending:false,nullsFirst:false}).order('id',{ascending:false});
+  if(submitted)q=q.eq('status','submitted');
+  if(sc.type==='activity')q=q.eq('activity_id',sc.id); else q=q.or(`home_unit_id_at_evaluation.eq.${sc.id},evaluation_unit_id.eq.${sc.id}`);
+  return q;
+}
+function recordRow(r,actions=false){
+  return `<tr><td data-label="Date">${dateText(r.test_date)}</td><td data-label="Cadet"><b>${esc(r.last_name_snapshot)}, ${esc(r.first_name_snapshot)}</b><br><span class="small muted">CAPID ${esc(r.capid_snapshot)}</span></td><td data-label="Test">${esc(r.test_label_snapshot)}</td><td data-label="Score"><b>${r.raw_score}/${r.max_score}</b></td><td data-label="Status">${r.status==='draft'?'<span class="tag draft">DRAFT</span>':r.passed?'<span class="tag pass">PASS</span>':'<span class="tag fail">FAIL</span>'}</td><td data-label="Testing Officer">${esc(r.testing_officer_name)}</td><td data-label="Evaluation Unit / Activity">${esc(r.evaluation_scope_type==='unit'?scopeLabel('unit',r.evaluation_unit_id):scopeLabel('activity',r.activity_id))}</td>${actions?`<td data-label="Actions"><button class="btn btn-secondary btn-sm" onclick="viewRecord('${r.id}')">View</button></td>`:''}</tr>`;
+}
+function table(rows,actions=false){
+  return `<div class="table-wrap"><table class="data-table mobile-card-table"><thead><tr><th>Date</th><th>Cadet</th><th>Test</th><th>Score</th><th>Status</th><th>Testing Officer</th><th>Evaluation Unit / Activity</th>${actions?'<th></th>':''}</tr></thead><tbody>${rows.map(r=>recordRow(r,actions)).join('')}</tbody></table></div>`;
+}
+function controls(kind,shown,total,limit){
+  if(total<=10)return'';
+  return `<div class="list-controls"><div class="list-controls-left"><button class="btn btn-secondary btn-sm" onclick="${kind}More()" ${shown>=total?'disabled':''}>Show 10 More</button><button class="btn btn-ghost btn-sm" onclick="${kind}Reset()">Show First 10</button></div><div class="list-controls-right"><div class="field"><label>Rows to show</label><input id="${kind}Limit" type="number" min="1" max="${MAX_ROWS}" value="${limit}"></div><button class="btn btn-secondary btn-sm" onclick="${kind}Apply()">Apply</button></div></div>`;
+}
+async function renderDashboard(){
+  const sc=currentScope(); $('#mainContent').innerHTML='<div class="panel loading">Loading dashboard…</div>';
+  try{
+    const x=await rpc('drill_dashboard_summary',{p_scope:sc.type,p_id:sc.id}),sum=Array.isArray(x)?x[0]:x;
+    const {data,error,count}=await queryRecords(sc,true).range(0,Math.min(dashLimit,MAX_ROWS)-1); if(error)throw error;
+    $('#mainContent').innerHTML=`<div class="panel"><h2>Dashboard — ${esc(scopeLabel(sc.type,sc.id))}</h2><div class="cards"><div class="metric"><div class="num">${sum?.submitted_count||0}</div><div class="label">Submitted Tests</div></div><div class="metric"><div class="num">${sum?.passing_count||0}</div><div class="label">Passing Results</div></div><div class="metric"><div class="num">${sum?.draft_count||0}</div><div class="label">Drafts</div></div><div class="metric"><div class="num">${sum?.cadets_tested||0}</div><div class="label">Cadets Tested</div></div></div></div><div class="panel"><h2>Recent Drill Tests</h2><p class="sub">Showing ${data.length} of ${count||0} submitted tests.</p>${table(data)}${controls('dash',data.length,count||0,dashLimit)}</div>`;
+  }catch(e){err(e)}
+}
+function dashMore(){dashLimit=Math.min(MAX_ROWS,dashLimit+10);renderDashboard();}
+function dashReset(){dashLimit=10;renderDashboard();}
+function dashApply(){dashLimit=Math.max(1,Math.min(MAX_ROWS,Number($('#dashLimit').value)||10));renderDashboard();}
+async function renderRecords(){
+  const sc=currentScope(); $('#mainContent').innerHTML='<div class="panel loading">Loading records…</div>';
+  try{
+    const {data,error,count}=await queryRecords(sc,false).range(0,Math.min(recordLimit,MAX_ROWS)-1); if(error)throw error;
+    $('#mainContent').innerHTML=`<div class="panel"><h2>Records — ${esc(scopeLabel(sc.type,sc.id))}</h2><p class="sub">Every record for this unit/activity that your role is authorized to see. Unit views also include the unit's cadets who were tested at Other Activities.</p>${table(data,true)}${count>data.length?`<div class="form-actions"><button class="btn btn-secondary" onclick="recordLimit=Math.min(${MAX_ROWS},recordLimit+25);renderRecords()">Show 25 More</button></div>`:''}</div>`;
+  }catch(e){err(e)}
+}
+async function renderReports(){
+  const sc=currentScope(); $('#mainContent').innerHTML='<div class="panel loading">Loading Reports…</div>';
+  try{
+    const {data,error,count}=await queryRecords(sc,true).range(0,Math.min(reportLimit,MAX_ROWS)-1); if(error)throw error;
+    $('#mainContent').innerHTML=`<div class="panel"><h2>Reports — eServices Entry List</h2><p class="sub">Newest first. Showing ${data.length} of ${count||0} submitted tests for ${esc(scopeLabel(sc.type,sc.id))}.</p>${table(data,true)}${controls('report',data.length,count||0,reportLimit)}</div>`;
+  }catch(e){err(e)}
+}
+function reportMore(){reportLimit=Math.min(MAX_ROWS,reportLimit+10);renderReports();}
+function reportReset(){reportLimit=10;renderReports();}
+function reportApply(){reportLimit=Math.max(1,Math.min(MAX_ROWS,Number($('#reportLimit').value)||10));renderReports();}
+async function viewRecord(id){
+  try{
+    const {data,error}=await sb.from('drill_records').select('*').eq('id',id).single(); if(error)throw error;
+    let canEdit=false; try{canEdit=!!(await rpc('can_edit_drill_record',{p_id:id}));}catch{}
+    const itemMap=new Map((data.test_items_snapshot||[]).map(i=>[String(i.id),i]));
+    const resultRows=Object.entries(data.results||{}).map(([k,v])=>{const it=itemMap.get(k);return `<tr><td>${esc(k)}</td><td>${esc(it?.command||'')}</td><td>${v===true?'Earned':v===false?'Not earned':esc(v)}</td></tr>`}).join('');
+    openModal('Drill Test Record',`<div class="grid grid-3"><div><b>Cadet</b><br>${esc(data.first_name_snapshot)} ${esc(data.last_name_snapshot)}<br>CAPID ${esc(data.capid_snapshot)}</div><div><b>${esc(data.test_label_snapshot)}</b><br>${esc(data.test_topic_snapshot||'')}</div><div><b>${dateText(data.test_date)}</b><br>${data.passed?'PASS':'FAIL'} — ${data.raw_score}/${data.max_score}</div></div><div class="section-title">Testing Officer</div><div>${esc(data.testing_officer_name)}</div>${resultRows?`<div class="section-title">Scoring</div><div class="table-wrap"><table class="data-table"><thead><tr><th>#</th><th>Item</th><th>Result</th></tr></thead><tbody>${resultRows}</tbody></table></div>`:''}${data.notes?`<div class="section-title">Notes</div><div>${esc(data.notes)}</div>`:''}`,`${canEdit?`<button class="btn btn-primary" onclick="editRecord('${id}')">Edit Record</button>`:''}<button class="btn btn-secondary" onclick="closeModal()">Close</button>`);
+  }catch(e){err(e)}
+}
+async function editRecord(id){
+  try{
+    const {data,error}=await sb.from('drill_records').select('*').eq('id',id).single(); if(error)throw error;
+    const allowed=await rpc('can_edit_drill_record',{p_id:id}); if(!allowed)throw new Error('You are not authorized to edit this record.');
+    editingRecord=data; testId=data.test_definition_id; closeModal(); view='entry'; renderNav(); renderEntry();
+  }catch(e){err(e)}
+}
+
+function mean(a){return a.length?a.reduce((x,y)=>x+y,0)/a.length:0;}
+function variance(a,m){return a.length<2?0:a.reduce((s,x)=>s+(x-m)**2,0)/(a.length-1);}
+// Numerical Recipes-style incomplete beta implementation for the Student-t CDF.
+function logGamma(z){const c=[676.5203681218851,-1259.1392167224028,771.3234287776531,-176.6150291621406,12.507343278686905,-0.13857109526572012,9.984369578019572e-6,1.5056327351493116e-7];if(z<0.5)return Math.log(Math.PI)-Math.log(Math.sin(Math.PI*z))-logGamma(1-z);z-=1;let x=0.9999999999998099;for(let i=0;i<c.length;i++)x+=c[i]/(z+i+1);const t=z+c.length-0.5;return 0.5*Math.log(2*Math.PI)+(z+0.5)*Math.log(t)-t+Math.log(x);}
+function betaCf(a,b,x){const MAX=200,EPS=3e-12,FPMIN=1e-300;let qab=a+b,qap=a+1,qam=a-1,c=1,d=1-qab*x/qap;if(Math.abs(d)<FPMIN)d=FPMIN;d=1/d;let h=d;for(let m=1;m<=MAX;m++){const m2=2*m;let aa=m*(b-m)*x/((qam+m2)*(a+m2));d=1+aa*d;if(Math.abs(d)<FPMIN)d=FPMIN;c=1+aa/c;if(Math.abs(c)<FPMIN)c=FPMIN;d=1/d;h*=d*c;aa=-(a+m)*(qab+m)*x/((a+m2)*(qap+m2));d=1+aa*d;if(Math.abs(d)<FPMIN)d=FPMIN;c=1+aa/c;if(Math.abs(c)<FPMIN)c=FPMIN;d=1/d;const del=d*c;h*=del;if(Math.abs(del-1)<EPS)break;}return h;}
+function betaI(a,b,x){if(x<=0)return 0;if(x>=1)return 1;const bt=Math.exp(logGamma(a+b)-logGamma(a)-logGamma(b)+a*Math.log(x)+b*Math.log(1-x));return x<(a+1)/(a+b+2)?bt*betaCf(a,b,x)/a:1-bt*betaCf(b,a,1-x)/b;}
+function tTwoTailP(t,df){if(!Number.isFinite(t)||!Number.isFinite(df)||df<=0)return NaN;const x=df/(df+t*t);return Math.max(0,Math.min(1,betaI(df/2,0.5,x)));}
+function welch(a,b){const ma=mean(a),mb=mean(b),va=variance(a,ma),vb=variance(b,mb),sa=va/a.length,sb=vb/b.length,se=Math.sqrt(sa+sb);if(!se)return 1;const t=Math.abs((ma-mb)/se),den=(sa*sa)/(a.length-1)+(sb*sb)/(b.length-1),df=den?((sa+sb)*(sa+sb))/den:Math.max(1,a.length+b.length-2);return tTwoTailP(t,df);}
+function bh(ps){const a=ps.map((p,i)=>({p,i})).sort((x,y)=>x.p-y.p),q=Array(ps.length);let prev=1;for(let j=a.length-1;j>=0;j--){prev=Math.min(prev,a[j].p*a.length/(j+1));q[a[j].i]=prev;}return q;}
+async function renderStatistics(){
+  const sc=currentScope(); $('#mainContent').innerHTML='<div class="panel loading">Loading statistics…</div>';
+  try{
+    const {data,error,count}=await queryRecords(sc,true).range(0,4999); if(error)throw error;
+    const names=await rpc('drill_user_names_for_visible_records'); const nameMap=new Map((names||[]).map(x=>[x.user_id,x.display_name]));
+    const testGroups={};
+    for(const r of data){const pct=r.max_score?100*r.raw_score/r.max_score:0;(testGroups[r.test_definition_id]??=[]).push(pct);}
+    const testMean=Object.fromEntries(Object.entries(testGroups).map(([k,v])=>[k,mean(v)]));
+    const map={};
+    for(const r of data){
+      const pct=r.max_score?100*r.raw_score/r.max_score:0;
+      const key=statsMode==='submitter'?(nameMap.get(r.created_by_user_id)||'Unknown Submitter'):(r.testing_officer_name||'Unknown Testing Officer');
+      (map[key]??=[]).push({pct,adj:pct-(testMean[r.test_definition_id]||0),pass:r.passed});
+    }
+    const groups=Object.entries(map).map(([name,vals])=>({name,n:vals.length,meanPct:mean(vals.map(v=>v.pct)),passRate:100*vals.filter(v=>v.pass).length/vals.length,meanAdj:mean(vals.map(v=>v.adj)),adj:vals.map(v=>v.adj)})).sort((a,b)=>a.meanAdj-b.meanAdj);
+    const pairs=[];
+    for(let i=0;i<groups.length;i++)for(let j=i+1;j<groups.length;j++){const A=groups[i],B=groups[j];pairs.push({A,B,p:A.n>=10&&B.n>=10?welch(A.adj,B.adj):NaN,d:A.meanAdj-B.meanAdj});}
+    const qs=bh(pairs.map(x=>Number.isFinite(x.p)?x.p:1)); pairs.forEach((x,i)=>x.q=Number.isFinite(x.p)?qs[i]:NaN);
+    $('#mainContent').innerHTML=`<div class="panel"><div style="display:flex;justify-content:space-between;gap:12px;align-items:end;flex-wrap:wrap"><div><h2>Fairness & Evaluator Statistics — ${esc(scopeLabel(sc.type,sc.id))}</h2><p class="sub">Exploratory comparisons intended to identify possible scoring patterns that deserve human review.</p></div><div class="field" style="margin:0;min-width:240px"><label>Analyze records by</label><select id="statsMode"><option value="officer" ${statsMode==='officer'?'selected':''}>Testing Officer</option><option value="submitter" ${statsMode==='submitter'?'selected':''}>Record Submitter</option></select></div></div><div class="alert alert-warn"><b>Oversight tool, not a misconduct finding.</b> Differences may reflect cadet experience, achievement mix, retests, scheduling, or assignment effects. Pairwise comparisons are suppressed below 10 records per person; samples below 30 are flagged small.</div>${count>5000?'<div class="alert alert-warn">More than 5,000 records exist; this screen analyzes the newest 5,000.</div>':''}<div class="alert alert-info"><b>Adjusted Score Difference</b> subtracts the selected unit/activity average for the same drill test before comparing people. This partially adjusts for different achievements and point scales.</div><div class="table-wrap"><table class="data-table"><thead><tr><th>${statsMode==='submitter'?'Submitter':'Testing Officer'}</th><th>Records</th><th>Mean Score</th><th>Pass Rate</th><th>Adjusted Difference</th><th>Sample</th></tr></thead><tbody>${groups.map(g=>`<tr><td>${esc(g.name)}</td><td>${g.n}</td><td>${g.meanPct.toFixed(1)}%</td><td>${g.passRate.toFixed(1)}%</td><td>${g.meanAdj>=0?'+':''}${g.meanAdj.toFixed(1)} pts</td><td>${g.n<10?'<span class="tag fail">TOO SMALL</span>':g.n<30?'<span class="tag draft">SMALL SAMPLE</span>':'<span class="tag pass">ADEQUATE</span>'}</td></tr>`).join('')}</tbody></table></div><div class="section-title">Pairwise Welch Tests + Benjamini-Hochberg False-Discovery-Rate Correction</div><div class="table-wrap"><table class="data-table"><thead><tr><th>A</th><th>B</th><th>N</th><th>Adjusted A − B</th><th>Interpretation</th></tr></thead><tbody>${pairs.map(p=>`<tr><td>${esc(p.A.name)}</td><td>${esc(p.B.name)}</td><td>${p.A.n}/${p.B.n}</td><td>${p.d>=0?'+':''}${p.d.toFixed(1)} pts</td><td>${Number.isFinite(p.q)?p.q<.05?`<span class="tag fail">STATISTICAL SIGNAL</span><br><span class="small">q=${p.q.toFixed(4)} — review underlying records and assignments manually.</span>`:`<span class="tag pass">NO SIGNAL</span><br><span class="small">q=${p.q.toFixed(4)}</span>`:'<span class="tag">NOT TESTED</span><br><span class="small">Need at least 10 records from each person.</span>'}</td></tr>`).join('')}</tbody></table></div></div>`;
+    $('#statsMode').onchange=e=>{statsMode=e.target.value;renderStatistics();};
+  }catch(e){err(e)}
+}
+
+async function renderAdmin(){
+  if(!canAdmin()) return navigate('entry');
+  const tabs=[];
+  if(ctx.appAdmin||unitAdminIds().length) tabs.push(['members','Member List'],['users','Users & Permissions']);
+  if(ctx.appAdmin) tabs.push(['units','Units']);
+  if(ctx.appAdmin||ctx.manageActivities||activityAdminIds().length) tabs.push(['activities','Other Activities']);
+  if(ctx.appAdmin) tabs.push(['tests','Drill Tests']);
+  if(!tabs.some(x=>x[0]===adminTab)) adminTab=tabs[0]?.[0]||'';
+  $('#mainContent').innerHTML=`<div class="panel"><h2>Administration</h2><p class="sub">Manage Drill Test Manager data and permissions without going into Supabase.</p><div class="admin-tabs">${tabs.map(([id,l])=>`<button class="admin-tab ${adminTab===id?'active':''}" onclick="adminTab='${id}';renderAdmin()">${l}</button>`).join('')}</div><div id="adminBody"><div class="loading">Loading…</div></div></div>`;
+  if(adminTab==='members') adminMembers();
+  else if(adminTab==='users') adminUsers();
+  else if(adminTab==='units') adminUnits();
+  else if(adminTab==='activities') adminActivities();
+  else if(adminTab==='tests') adminTests();
+}
+
+async function adminMembers(){
+  const ids=unitAdminIds(); if(!ids.length) return $('#adminBody').innerHTML='<div class="empty">No unit administration permissions.</div>';
+  const unitId=(window.__memberAdminUnit&&ids.includes(window.__memberAdminUnit))?window.__memberAdminUnit:ids[0]; window.__memberAdminUnit=unitId;
+  const status=window.__memberStatus||'active';
+  const {data,error}=await sb.from('member_unit_assignments').select('member_id,unit_id,members(id,capid,first_name,last_name,active,member_type)').eq('unit_id',unitId).eq('active',true).eq('is_primary',true);
+  if(error)return err(error);
+  const rows=(data||[]).filter(x=>status==='all'||(status==='active'?x.members?.active:x.members?.active===false)).sort((a,b)=>(a.members?.last_name||'').localeCompare(b.members?.last_name||''));
+  $('#adminBody').innerHTML=`<div class="grid grid-2"><div class="field"><label>Member List Unit</label><select id="memberAdminUnit">${ids.map(id=>`<option value="${id}" ${id===unitId?'selected':''}>${esc(scopeLabel('unit',id))}</option>`).join('')}</select></div><div class="field"><label>Member Status</label><select id="memberStatus"><option value="active" ${status==='active'?'selected':''}>Active</option><option value="inactive" ${status==='inactive'?'selected':''}>Inactive</option><option value="all" ${status==='all'?'selected':''}>All</option></select></div></div><div class="form-actions" style="justify-content:flex-start"><button class="btn btn-primary" onclick="editMember('', '${unitId}')">Add Member</button></div><div class="table-wrap"><table class="data-table"><thead><tr><th>CAPID</th><th>Name</th><th>Type</th><th>Status</th><th></th></tr></thead><tbody>${rows.map(x=>{const m=x.members;return `<tr><td>${esc(m.capid)}</td><td>${esc(m.last_name)}, ${esc(m.first_name)}</td><td>${esc(m.member_type)}</td><td>${m.active?'<span class="tag pass">ACTIVE</span>':'<span class="tag">INACTIVE</span>'}</td><td><button class="btn btn-secondary btn-sm" onclick="editMember('${m.id}','${unitId}')">Edit</button></td></tr>`}).join('')}</tbody></table></div>`;
+  $('#memberAdminUnit').onchange=e=>{window.__memberAdminUnit=e.target.value;adminMembers();};
+  $('#memberStatus').onchange=e=>{window.__memberStatus=e.target.value;adminMembers();};
+}
+async function editMember(id,unitId){
+  let m={id:'',capid:'',first_name:'',last_name:'',active:true};
+  if(id){const {data,error}=await sb.from('members').select('*').eq('id',id).single();if(error)return err(error);m=data;}
+  openModal(id?'Edit Member':'Add Member',`<div class="grid grid-2"><div class="field"><label>CAPID</label><input id="mCapid" value="${esc(m.capid||'')}"></div><div class="field"><label>Home Unit</label><select id="mUnit">${unitAdminIds().map(x=>`<option value="${x}" ${x===unitId?'selected':''}>${esc(scopeLabel('unit',x))}</option>`).join('')}</select></div><div class="field"><label>First Name</label><input id="mFirst" value="${esc(m.first_name||'')}"></div><div class="field"><label>Last Name</label><input id="mLast" value="${esc(m.last_name||'')}"></div></div><div class="check-card"><label><input id="mActive" type="checkbox" ${m.active?'checked':''}> Active member</label><small>Inactive members remain in history and can still be evaluated by typing their CAPID.</small></div>`,`<button class="btn btn-primary" onclick="saveMemberAdmin('${id}')">Save Member</button>`);
+}
+async function saveMemberAdmin(id){
+  try{await rpc('drill_upsert_member',{p_member:id||null,p_capid:$('#mCapid').value.trim(),p_first:$('#mFirst').value.trim(),p_last:$('#mLast').value.trim(),p_home:$('#mUnit').value,p_active:$('#mActive').checked});closeModal();adminMembers();toast('Member saved.');}catch(e){err(e)}
+}
+
+async function adminUsers(){
+  try{
+    const rows=await rpc('drill_admin_directory');
+    const audit=await rpc('drill_permission_audit');
+    const {data:unitPerms,error:upe}=await sb.from('drill_unit_permissions').select('*'); if(upe)throw upe;
+    $('#adminBody').innerHTML=`<div class="form-actions" style="justify-content:flex-start"><button class="btn btn-primary" onclick="newUser()">Create / Link User</button>${unitAdminIds().length?'<button class="btn btn-secondary" onclick="grantVisitor()">Grant Temporary Cross-Unit Access</button>':''}</div><div class="table-wrap"><table class="data-table"><thead><tr><th>User</th><th>Home Unit</th><th>Permissions</th><th></th></tr></thead><tbody>${rows.map(u=>{const ps=(unitPerms||[]).filter(p=>p.user_id===u.user_id&&!p.revoked_at&&(!p.expires_at||new Date(p.expires_at)>=new Date()));return `<tr><td><b>${esc(u.display_name)}</b><br><span class="small muted">${esc(u.email)}</span></td><td>${u.home_unit_id?esc(scopeLabel('unit',u.home_unit_id)):'—'}</td><td>${u.is_app_admin?'<span class="tag admin">APP ADMIN</span> ':''}${u.manage_activities?'<span class="tag admin">CREATE ACTIVITIES</span> ':''}${ps.map(p=>`<span class="tag">${esc(scopeLabel('unit',p.unit_id))}: ${p.unit_admin?'Unit Admin':'Data Entry'}${p.expires_at?` • exp ${new Date(p.expires_at).toLocaleDateString()}`:''}</span>`).join(' ')||'—'}</td><td><button class="btn btn-secondary btn-sm" onclick="manageUser('${u.user_id}','${u.home_unit_id||''}')">Manage</button></td></tr>`}).join('')}</tbody></table></div><div class="section-title">Recent Permission Audit</div><div class="table-wrap"><table class="data-table"><thead><tr><th>Time</th><th>Action</th><th>Target</th><th>Scope</th><th>Details</th></tr></thead><tbody>${(audit||[]).slice(0,40).map(a=>`<tr><td>${new Date(a.created_at).toLocaleString()}</td><td>${esc(a.action)}</td><td>${esc(a.target_user_id||'')}</td><td>${a.unit_id?esc(scopeLabel('unit',a.unit_id)):a.activity_id?esc(scopeLabel('activity',a.activity_id)):'—'}</td><td class="small">${esc(JSON.stringify(a.details||{}))}</td></tr>`).join('')}</tbody></table></div>`;
+  }catch(e){err(e)}
+}
+function newUser(){
+  openModal('Create / Link Drill User',`<div class="field"><label>Email</label><input id="nuEmail" type="email"></div><div class="field"><label>Initial Password</label><input id="nuPass" type="text"><div class="small muted">Only used when the Supabase Auth account does not already exist.</div></div><div class="field"><label>CAPID</label><input id="nuCapid" inputmode="numeric"></div><div class="alert alert-info">The CAPID must already exist in the shared member roster. Add the member first if necessary.</div>`,`<button class="btn btn-primary" onclick="saveNewUser()">Create / Link User</button>`);
+}
+async function saveNewUser(){
+  try{
+    const rr=await rpc('drill_lookup_member',{p_capid:$('#nuCapid').value.trim()}),m=Array.isArray(rr)?rr[0]:rr;
+    if(!m)return toast('CAPID not found. Add the member first.',true);
+    const {data,error}=await sb.functions.invoke(CFG.adminFunctionName||'drill-admin-users',{body:{action:'ensure_user',email:$('#nuEmail').value.trim(),password:$('#nuPass').value,displayName:`${m.first_name} ${m.last_name}`,memberId:m.member_id}});
+    if(error)throw error;if(data?.error)throw new Error(data.error);closeModal();adminUsers();toast(data.created?'User created and linked.':'Existing login linked to member.');
+  }catch(e){err(e)}
+}
+async function manageUser(userId,homeUnit){
+  try{
+    const {data:unitPerms,error:e1}=await sb.from('drill_unit_permissions').select('*').eq('user_id',userId);if(e1)throw e1;
+    let activityPerms=[]; if(ctx.appAdmin){const r=await sb.from('drill_activity_permissions').select('*').eq('user_id',userId);if(r.error)throw r.error;activityPerms=r.data||[];}
+    const editable=unitAdminIds();
+    window.__managedUser={userId,homeUnit,unitPerms:unitPerms||[],activityPerms};
+    const localRows=editable.map(id=>{const p=(unitPerms||[]).find(x=>x.unit_id===id&&!x.revoked_at);return `<tr><td><b>${esc(scopeLabel('unit',id))}</b></td><td><input class="permEntry" data-unit="${id}" type="checkbox" ${p?.data_entry||p?.unit_admin?'checked':''}></td><td><input class="permAdmin" data-unit="${id}" type="checkbox" ${p?.unit_admin?'checked':''}></td></tr>`}).join('');
+    const foreign=(unitPerms||[]).filter(p=>!editable.includes(p.unit_id)&&!p.revoked_at&&(!p.expires_at||new Date(p.expires_at)>=new Date()));
+    const globalHtml=ctx.appAdmin?`<div class="section-title">Application-Wide Permissions</div><div class="check-card"><label><input id="muAppAdmin" type="checkbox"> Drill Application Administrator</label><small>Full control of this Drill application.</small></div><div class="check-card"><label><input id="muManageActivities" type="checkbox"> Create / Manage Other Activities</label><small>Allows creation of encampments, wing drills, cadet-program activities, etc.</small></div>`:'';
+    const activityHtml=ctx.appAdmin?`<div class="section-title">Other Activity Permissions</div><div class="table-wrap"><table class="data-table"><thead><tr><th>Activity</th><th>Data Entry</th><th>Activity Admin</th></tr></thead><tbody>${activities.map(a=>{const p=activityPerms.find(x=>x.activity_id===a.id&&!x.revoked_at);return `<tr><td>${esc(scopeLabel('activity',a.id))}</td><td><input class="actEntry" data-activity="${a.id}" type="checkbox" ${p?.data_entry||p?.activity_admin?'checked':''}></td><td><input class="actAdmin" data-activity="${a.id}" type="checkbox" ${p?.activity_admin?'checked':''}></td></tr>`}).join('')}</tbody></table></div>`:'';
+    openModal('Manage User Permissions',`<div class="alert alert-info">You can grant or change permissions only for units you administer. If this is one of your home-unit members, you may revoke borrowed permissions granted by another unit, but you cannot increase those foreign permissions.</div>${globalHtml}<div class="section-title">My Unit Permissions</div><div class="table-wrap"><table class="data-table"><thead><tr><th>Unit</th><th>Data Entry</th><th>Unit Admin</th></tr></thead><tbody>${localRows||'<tr><td colspan="3">No unit-admin scopes.</td></tr>'}</tbody></table></div>${foreign.length?`<div class="section-title">Foreign / Borrowed Permissions</div>${foreign.map(p=>`<div class="check-card"><b>${esc(scopeLabel('unit',p.unit_id))}</b> — ${p.unit_admin?'Unit Admin':'Data Entry'}${p.expires_at?` — expires ${new Date(p.expires_at).toLocaleString()}`:''}${homeUnit&&p.unit_id!==homeUnit?` <button class="btn btn-danger btn-sm" onclick="revokeBorrowed('${userId}','${p.unit_id}')">Revoke</button>`:''}</div>`).join('')}`:''}${activityHtml}`,`<button class="btn btn-primary" onclick="saveManagedUser()">Save Permissions</button>`);
+    if(ctx.appAdmin){
+      const row=(await rpc('drill_admin_directory')).find(x=>x.user_id===userId); if(row){$('#muAppAdmin').checked=!!row.is_app_admin;$('#muManageActivities').checked=!!row.manage_activities;}
+    }
+  }catch(e){err(e)}
+}
+async function saveManagedUser(){
+  const m=window.__managedUser;if(!m)return;
+  try{
+    for(const id of unitAdminIds()){
+      const entry=$(`.permEntry[data-unit="${id}"]`)?.checked||false,admin=$(`.permAdmin[data-unit="${id}"]`)?.checked||false;
+      const old=m.unitPerms.find(x=>x.unit_id===id&&!x.revoked_at);
+      if(entry||admin) await rpc('drill_set_unit_permission',{p_user:m.userId,p_unit:id,p_entry:entry,p_admin:admin,p_expires:null,p_note:'Managed through Drill Test Manager'});
+      else if(old) await rpc('drill_revoke_unit_access',{p_user:m.userId,p_unit:id,p_reason:'Removed by Unit/Application Admin'});
+    }
+    if(ctx.appAdmin){
+      // Save activity permissions before global roles so an App Admin who intentionally
+      // removes their own App Admin flag does not lose authorization halfway through this save.
+      for(const a of activities){
+        const entry=$(`.actEntry[data-activity="${a.id}"]`)?.checked||false,admin=$(`.actAdmin[data-activity="${a.id}"]`)?.checked||false;
+        const old=m.activityPerms.find(x=>x.activity_id===a.id&&!x.revoked_at);
+        if(entry||admin) await rpc('drill_set_activity_permission',{p_user:m.userId,p_activity:a.id,p_entry:entry,p_admin:admin,p_expires:null,p_note:'Managed through Drill Test Manager'});
+        else if(old) await rpc('drill_revoke_activity_access',{p_user:m.userId,p_activity:a.id,p_reason:'Removed by Application Admin'});
+      }
+      await rpc('drill_set_global_permissions',{p_user:m.userId,p_app:$('#muAppAdmin').checked,p_manage:$('#muManageActivities').checked});
+    }
+    closeModal();await loadCore();renderHeader();adminUsers();toast('Permissions saved.');
+  }catch(e){err(e)}
+}
+function grantVisitor(){
+  openModal('Grant Temporary Cross-Unit Access',`<div class="field"><label>Host Unit</label><select id="gvUnit">${unitAdminIds().map(id=>`<option value="${id}">${esc(scopeLabel('unit',id))}</option>`).join('')}</select></div><div class="field"><label>Visitor Email</label><input id="gvEmail" type="email"></div><div class="field"><label>Expiration</label><select id="gvDuration"><option value="tonight">Tonight</option><option value="7">7 days</option><option value="30">30 days</option><option value="custom">Custom Date / Time</option><option value="none">No expiration</option></select></div><div id="gvCustomWrap" class="field hidden"><label>Custom expiration</label><input id="gvCustom" type="datetime-local"></div><div class="field"><label>Note</label><input id="gvNote" value="Cross-unit drill testing"></div><div class="small muted">Cross-unit grants made by a Unit Admin are Data Entry only. The visitor's home Unit Admin can revoke them later.</div>`,`<button class="btn btn-primary" onclick="saveVisitorGrant()">Grant Data Entry</button>`);
+  $('#gvDuration').onchange=e=>$('#gvCustomWrap').classList.toggle('hidden',e.target.value!=='custom');
+}
+async function saveVisitorGrant(){
+  try{
+    const host=$('#gvUnit').value,email=$('#gvEmail').value.trim();
+    const rr=await rpc('drill_find_user_for_host_grant',{p_email:email,p_host_unit:host}),u=Array.isArray(rr)?rr[0]:rr;
+    if(!u)return toast('No linked Drill user was found with that exact email. Their home unit should create/link the login first.',true);
+    let exp=null,d=$('#gvDuration').value;
+    if(d==='tonight'){const x=new Date();x.setHours(23,59,59,999);exp=x.toISOString();}
+    else if(d==='7'||d==='30'){const x=new Date();x.setDate(x.getDate()+Number(d));exp=x.toISOString();}
+    else if(d==='custom'){if(!$('#gvCustom').value)return toast('Choose the custom expiration date/time.',true);exp=new Date($('#gvCustom').value).toISOString();}
+    await rpc('drill_grant_temporary_unit_access',{p_user:u.user_id,p_unit:host,p_expires:exp,p_note:$('#gvNote').value.trim()});
+    closeModal();adminUsers();toast(`Temporary access granted to ${u.display_name}.`);
+  }catch(e){err(e)}
+}
+async function revokeBorrowed(userId,unitId){
+  if(!confirm('Revoke this borrowed permission?'))return;
+  try{await rpc('drill_revoke_unit_access',{p_user:userId,p_unit:unitId,p_reason:'Revoked by home-unit administrator'});closeModal();adminUsers();toast('Borrowed permission revoked.');}catch(e){err(e)}
+}
+
+function adminUnits(){
+  $('#adminBody').innerHTML=`<div class="form-actions" style="justify-content:flex-start"><button class="btn btn-primary" onclick="editUnit()">Add Unit</button></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Charter</th><th>Name</th><th>Status</th><th></th></tr></thead><tbody>${units.map(u=>`<tr><td>${esc(u.charter_number)}</td><td>${esc(u.name)}</td><td>${u.active?'<span class="tag pass">ACTIVE</span>':'<span class="tag">INACTIVE</span>'}</td><td><button class="btn btn-secondary btn-sm" onclick="editUnit('${u.id}')">Edit</button></td></tr>`).join('')}</tbody></table></div>`;
+}
+function editUnit(id=''){
+  const u=units.find(x=>x.id===id)||{charter_number:'',name:'',active:true};
+  openModal(id?'Edit Unit':'Add Unit',`<div class="grid grid-2"><div class="field"><label>Charter</label><input id="euCharter" value="${esc(u.charter_number||'')}"></div><div class="field"><label>Name</label><input id="euName" value="${esc(u.name||'')}"></div></div><div class="check-card"><label><input id="euActive" type="checkbox" ${u.active?'checked':''}> Active</label></div>`,`<button class="btn btn-primary" onclick="saveUnit('${id}')">Save Unit</button>`);
+}
+async function saveUnit(id){
+  try{await rpc('drill_upsert_unit',{p_id:id||null,p_charter:$('#euCharter').value,p_name:$('#euName').value,p_active:$('#euActive').checked});closeModal();await loadCore();renderHeader();adminUnits();toast('Unit saved.');}catch(e){err(e)}
+}
+
+function adminActivities(){
+  const manageable=ctx.appAdmin||ctx.manageActivities?activities:activities.filter(a=>canActivity(a.id,true));
+  $('#adminBody').innerHTML=`<div class="form-actions" style="justify-content:flex-start">${ctx.appAdmin||ctx.manageActivities?'<button class="btn btn-primary" onclick="editActivity()">Add Activity</button>':''}</div><div class="table-wrap"><table class="data-table"><thead><tr><th>Type</th><th>Name</th><th>Location</th><th>Dates</th><th>Status</th><th></th></tr></thead><tbody>${manageable.map(a=>`<tr><td>${esc(a.activity_type)}</td><td><b>${esc(a.name)}</b></td><td>${esc(a.location)}</td><td>${dateText(a.start_date)} – ${dateText(a.end_date)}</td><td>${a.active?'<span class="tag pass">ACTIVE</span>':'<span class="tag">INACTIVE</span>'}</td><td><button class="btn btn-secondary btn-sm" onclick="editActivity('${a.id}')">Edit</button></td></tr>`).join('')}</tbody></table></div>`;
+}
+function editActivity(id=''){
+  const a=activities.find(x=>x.id===id)||{activity_type:'Cadet Program Activity',name:'',location:'',start_date:'',end_date:'',active:true};
+  openModal(id?'Edit Activity':'Add Other Activity',`<div class="grid grid-2"><div class="field"><label>Type</label><input id="eaType" value="${esc(a.activity_type)}" list="actTypes"><datalist id="actTypes"><option value="Encampment"><option value="Wing Drill"><option value="Cadet Program Activity"><option value="Wing Conference"><option value="Training Activity"><option value="Other"></datalist></div><div class="field"><label>Name</label><input id="eaName" value="${esc(a.name)}"></div><div class="field"><label>Location</label><input id="eaLocation" value="${esc(a.location)}"></div><div class="field"><label>Start</label><input id="eaStart" type="date" value="${esc(a.start_date)}"></div><div class="field"><label>End</label><input id="eaEnd" type="date" value="${esc(a.end_date)}"></div></div><div class="check-card"><label><input id="eaActive" type="checkbox" ${a.active?'checked':''}> Active / available for new tests</label></div>`,`<button class="btn btn-primary" onclick="saveActivity('${id}')">Save Activity</button>`);
+}
+async function saveActivity(id){
+  try{await rpc('drill_save_activity',{p_id:id||null,p_type:$('#eaType').value,p_name:$('#eaName').value,p_location:$('#eaLocation').value,p_start:$('#eaStart').value,p_end:$('#eaEnd').value,p_active:$('#eaActive').checked});closeModal();await loadCore();renderHeader();adminActivities();toast('Activity saved.');}catch(e){err(e)}
+}
+
+function adminTests(){
+  $('#adminBody').innerHTML=`<div class="form-actions" style="justify-content:flex-start"><button class="btn btn-primary" onclick="editTest()">Add Test</button></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Code</th><th>Test</th><th>Scoring</th><th>Pass</th><th>Status</th><th></th></tr></thead><tbody>${tests.map(t=>`<tr><td>${esc(t.code)}</td><td><b>${esc(t.label)}</b><br><span class="small muted">${esc(t.topic)}</span></td><td>${t.scoring_mode==='points'?'Points':'S/U'}</td><td>${t.pass_required}/${t.max_score}</td><td>${t.active?'<span class="tag pass">ACTIVE</span>':'<span class="tag">INACTIVE</span>'}</td><td><button class="btn btn-secondary btn-sm" onclick="editTest('${t.id}')">Edit</button></td></tr>`).join('')}</tbody></table></div>`;
+}
+function editTest(id=''){
+  const t=id?tests.find(x=>x.id===id):{id:'',code:'',label:'',topic:'',conditions:'',scoring_mode:'su',pass_required:1,max_score:1,source_page:'',sequence:[],active:true,display_order:100,items:[]};
+  window.__editTest=JSON.parse(JSON.stringify(t));
+  openModal(id?'Edit Drill Test':'Add Drill Test',`<div class="grid grid-3"><div class="field"><label>Code</label><input id="etCode" value="${esc(t.code)}"></div><div class="field"><label>Label</label><input id="etLabel" value="${esc(t.label)}"></div><div class="field"><label>Source Pages</label><input id="etPage" value="${esc(t.source_page||'')}"></div></div><div class="field"><label>Topic</label><input id="etTopic" value="${esc(t.topic)}"></div><div class="field"><label>Conditions</label><textarea id="etConditions">${esc(t.conditions)}</textarea></div><div class="grid grid-3"><div class="field"><label>Mode</label><select id="etMode"><option value="su" ${t.scoring_mode==='su'?'selected':''}>S/U</option><option value="points" ${t.scoring_mode==='points'?'selected':''}>Points</option></select></div><div class="field"><label>Passing Score</label><input id="etPass" type="number" value="${t.pass_required}"></div><div class="field"><label>Maximum Score</label><input id="etMax" type="number" value="${t.max_score}"></div></div><div class="check-card"><label><input id="etActive" type="checkbox" ${t.active?'checked':''}> Active / available for new tests</label></div><div class="section-title">Graded Items</div><div class="small muted">Advanced editor: JSON array. Each item uses id, command, standards[], points, and optional group.</div><textarea id="etItems" style="min-height:260px">${esc(JSON.stringify(t.items,null,2))}</textarea><div class="section-title">Command Sequence / Reference</div><textarea id="etSequence" style="min-height:200px">${esc((t.sequence||[]).join('\n'))}</textarea><div class="small muted">One command per line. Prefix ungraded steps with an em dash (—) or two hyphens (--).</div>`,`<button class="btn btn-primary" onclick="saveTest('${id}')">Save Test Definition</button>`);
+}
+async function saveTest(id){
+  try{
+    const items=JSON.parse($('#etItems').value); if(!Array.isArray(items)||!items.length)throw new Error('At least one graded item is required.');
+    const payload={id:id||null,code:$('#etCode').value.trim(),label:$('#etLabel').value.trim(),topic:$('#etTopic').value.trim(),conditions:$('#etConditions').value.trim(),scoringMode:$('#etMode').value,passRequired:Number($('#etPass').value),maxScore:Number($('#etMax').value),sourcePage:$('#etPage').value.trim(),sequence:$('#etSequence').value.split(/\n+/).map(x=>x.trim()).filter(Boolean),active:$('#etActive').checked,displayOrder:window.__editTest?.display_order||100,items};
+    await rpc('drill_save_test_definition',{p:payload}); closeModal(); await loadCore(); adminTests(); toast('Drill test definition saved.');
+  }catch(e){err(e)}
+}
+
+$('#loginBtn').onclick=login;
+$('#loginPassword').onkeydown=e=>{if(e.key==='Enter')login();};
+$('#logoutBtn').onclick=logout;
+$('#defaultScope').onchange=e=>changeScope(e.target.value);
+
+if(sb){
+  sb.auth.onAuthStateChange(async (_event,session)=>{
+    if(session?.user){
+      try{await loadCore();showApp();}catch(e){err(e);}
+    }else{
+      me=null;ctx=null;$('#app').classList.add('hidden');$('#loginScreen').classList.remove('hidden');
+    }
+  });
+}
+publicSequences();
+if('serviceWorker' in navigator && location.protocol==='https:') navigator.serviceWorker.register('./service-worker.js').catch(console.warn);
