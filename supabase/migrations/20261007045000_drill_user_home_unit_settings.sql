@@ -144,3 +144,27 @@ begin
 end $$;
 revoke execute on function public.drill_set_unit_permission(uuid,uuid,boolean,boolean,timestamptz,text) from public, anon;
 grant execute on function public.drill_set_unit_permission(uuid,uuid,boolean,boolean,timestamptz,text) to authenticated;
+
+
+create or replace function public.drill_user_names_for_visible_records()
+returns table(user_id uuid, display_name text)
+language sql
+stable
+security definer
+set search_path to 'pg_catalog'
+as $$
+  select distinct p.id,coalesce(nullif(p.display_name,''),'CAP User')::text
+  from public.profiles p
+  where p.id=auth.uid()
+     or exists(
+       select 1 from public.drill_records r
+       where r.created_by_user_id=p.id
+         and public.can_read_drill_record(
+           r.status,r.home_unit_id_at_evaluation,r.evaluation_scope_type,
+           r.evaluation_unit_id,r.activity_id,r.created_by_user_id
+         )
+     )
+  order by 2;
+$$;
+revoke execute on function public.drill_user_names_for_visible_records() from public, anon;
+grant execute on function public.drill_user_names_for_visible_records() to authenticated;
