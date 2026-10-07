@@ -76,9 +76,10 @@ Complete this after database migration, Edge Function deployment, and GitHub dep
 - [ ] Historical records remain after status changes.
 
 ## User and permission administration
-- [ ] Home Unit Admin can create/link a login for a member of their unit.
+- [ ] Home Unit Admin can create/authorize a shared login with their unit as its Drill Home Unit.
 - [ ] Shared Auth users appear in the Application Admin directory.
-- [ ] An unlinked shared login is clearly marked and cannot receive unit permissions until linked to a CAPID/home unit.
+- [ ] A shared login can be assigned a Drill Home Unit without a CAPID/member link.
+- [ ] Unit permissions require a Drill Home Unit, not a CAPID link.
 - [ ] Unit Admin can assign Data Entry in their unit.
 - [ ] Unit Admin can assign Unit Admin in their own unit.
 - [ ] Home Unit Admin cannot directly grant another unit's permission.
@@ -90,7 +91,7 @@ Complete this after database migration, Edge Function deployment, and GitHub dep
 ## Temporary cross-unit permission scenario
 Use MT-060 and MT-012 for this test.
 
-- [ ] MT-060 visitor has an existing linked login.
+- [ ] MT-060 visitor has an existing shared login with Drill Home Unit MT-060.
 - [ ] MT-012 Unit Admin searches that visitor by exact email.
 - [ ] MT-012 can grant temporary MT-012 Data Entry.
 - [ ] MT-012 cannot grant the outside member Unit Admin unless using Application Admin.
