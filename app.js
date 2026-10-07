@@ -11,14 +11,15 @@ let view = 'entry';
 let testId = null;
 let adminTab = 'members';
 let editingRecord = null;
-let dashLimit = 10;
-let reportLimit = 10;
-let recordLimit = 25;
-let recordSearch = '';
-let recordStatus = 'all';
-let recordTestFilter = 'all';
+let recordLimit = 50;
+let reportMember = 'all';
+let reportTest = 'all';
+let reportResult = 'all';
+let reportStart = '';
+let reportEnd = '';
 let statsMode = 'officer';
 const MAX_ROWS = 250;
+const ANALYTICS_MAX = 5000;
 
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
@@ -155,7 +156,7 @@ async function changeScope(v){
   try{
     await rpc('drill_set_user_preference',{p_scope:type,p_id:id});
     ctx.defaultScopeType=type; ctx.defaultUnitId=type==='unit'?id:null; ctx.defaultActivityId=type==='activity'?id:null;
-    dashLimit=10; reportLimit=10; recordLimit=25; recordSearch=''; recordStatus='all'; recordTestFilter='all'; editingRecord=null;
+    recordLimit=50; reportMember='all'; reportTest='all'; reportResult='all'; reportStart=''; reportEnd=''; editingRecord=null;
     renderHeader(); navigate(view);
   }catch(e){err(e)}
 }
@@ -278,6 +279,94 @@ function queryRecords(sc,submitted=false){
   if(sc.type==='activity')q=q.eq('activity_id',sc.id); else q=q.or(`home_unit_id_at_evaluation.eq.${sc.id},evaluation_unit_id.eq.${sc.id}`);
   return q;
 }
+
+function querySubmittedQueue(sc){
+  let q=sb.from('drill_records').select('*',{count:'exact'}).eq('status','submitted')
+    .order('test_date',{ascending:true}).order('submitted_at',{ascending:true,nullsFirst:false}).order('id',{ascending:true});
+  if(sc.type==='activity')q=q.eq('activity_id',sc.id); else q=q.or(`home_unit_id_at_evaluation.eq.${sc.id},evaluation_unit_id.eq.${sc.id}`);
+  return q;
+}
+async function loadSubmittedForAnalysis(sc,max=ANALYTICS_MAX){
+  const out=[],pageSize=500;
+  for(let start=0;start<max;start+=pageSize){
+    const end=Math.min(max-1,start+pageSize-1);
+    const {data,error}=await queryRecords(sc,true).range(start,end);
+    if(error)throw error;
+    out.push(...(data||[]));
+    if(!data||data.length<pageSize)break;
+  }
+  return out;
+}
+function recordMemberKey(r){return r.subject_member_id||('capid:'+String(r.capid_snapshot||''));}
+function recordScorePct(r){return r.max_score?100*Number(r.raw_score||0)/Number(r.max_score):0;}
+function passingStandard(r){
+  const need=Number(r.pass_required_snapshot||0),max=Number(r.max_score||0);
+  return max?`${need}/${max} (${Math.round(100*need/max)}%)`:`${need}`;
+}
+function reportMisses(rows){
+  const map=new Map();
+  for(const r of rows){
+    const items=new Map((r.test_items_snapshot||[]).map(i=>[String(i.id??i.item_key??''),i]));
+    for(const [itemId,value] of Object.entries(r.results||{})){
+      const attempted=value==='S'||value==='U'||value===true||value===false;
+      if(!attempted)continue;
+      const item=items.get(String(itemId))||{};
+      const command=item.command||('Item '+itemId);
+      const key=[r.test_definition_id,itemId,command].join('|');
+      const x=map.get(key)||{testId:r.test_definition_id,test:r.test_label_snapshot||r.test_code_snapshot||'Drill Test',itemId,command,attempts:0,misses:0};
+      x.attempts++;
+      if(value==='U'||value===false)x.misses++;
+      map.set(key,x);
+    }
+  }
+  return [...map.values()].filter(x=>x.misses>0).map(x=>({...x,rate:100*x.misses/x.attempts}))
+    .sort((a,b)=>b.misses-a.misses||b.rate-a.rate||a.test.localeCompare(b.test));
+}
+function achievementReport(rows){
+  const groups=new Map();
+  for(const r of rows){
+    const key=r.test_definition_id||r.test_label_snapshot;
+    const g=groups.get(key)||{id:key,label:r.test_label_snapshot||r.test_code_snapshot||'Drill Test',rows:[]};
+    g.rows.push(r);groups.set(key,g);
+  }
+  return [...groups.values()].map(g=>{
+    const scores=g.rows.map(recordScorePct);
+    const passes=g.rows.filter(r=>r.passed).length;
+    const misses=reportMisses(g.rows);
+    const first=g.rows[0];
+    return {
+      id:g.id,label:g.label,attempts:g.rows.length,passRate:g.rows.length?100*passes/g.rows.length:0,
+      avg:mean(scores),min:scores.length?Math.min(...scores):0,max:scores.length?Math.max(...scores):0,
+      standard:passingStandard(first),mostMissed:misses[0]?.command||'—',missCount:misses[0]?.misses||0
+    };
+  }).sort((a,b)=>a.label.localeCompare(b.label));
+}
+function monthlyTrend(rows,months=6){
+  const now=new Date(),keys=[];
+  for(let i=months-1;i>=0;i--){
+    const d=new Date(now.getFullYear(),now.getMonth()-i,1);
+    keys.push({key:`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`,label:d.toLocaleDateString(undefined,{month:'short',year:'2-digit'}),count:0,passes:0});
+  }
+  const by=new Map(keys.map(x=>[x.key,x]));
+  for(const r of rows){
+    const k=String(r.test_date||'').slice(0,7),x=by.get(k);
+    if(x){x.count++;if(r.passed)x.passes++;}
+  }
+  return keys;
+}
+function trendBars(points){
+  if(!points.some(x=>x.count))return '<div class="empty">No submitted drill tests in this period.</div>';
+  const max=Math.max(1,...points.map(x=>x.count));
+  return '<div class="trend-chart">'+points.map(x=>{
+    const width=Math.max(2,Math.round(100*x.count/max));
+    const rate=x.count?Math.round(100*x.passes/x.count):0;
+    return '<div class="trend-row"><div class="trend-label">'+esc(x.label)+'</div><div class="trend-track"><div class="trend-fill" style="width:'+width+'%"></div></div><div class="trend-value"><b>'+x.count+'</b> <span class="small muted">'+rate+'% pass</span></div></div>';
+  }).join('')+'</div>';
+}
+function queueTable(rows,startIndex=0){
+  return `<div class="table-wrap"><table class="data-table mobile-card-table"><thead><tr><th>#</th><th>Date</th><th>Cadet</th><th>Drill Test</th><th>Score</th><th>Result</th><th>Testing Officer</th><th></th></tr></thead><tbody>${rows.map((r,i)=>`<tr><td data-label="#">${startIndex+i+1}</td><td data-label="Date">${dateText(r.test_date)}</td><td data-label="Cadet"><b>${esc(r.last_name_snapshot)}, ${esc(r.first_name_snapshot)}</b><br><span class="small muted">CAPID ${esc(r.capid_snapshot)}</span></td><td data-label="Drill Test">${esc(r.test_label_snapshot)}</td><td data-label="Score"><b>${r.raw_score}/${r.max_score}</b></td><td data-label="Result">${r.passed?'<span class="tag pass">PASS</span>':'<span class="tag fail">FAIL</span>'}</td><td data-label="Testing Officer">${esc(r.testing_officer_name)}</td><td><button class="btn btn-secondary btn-sm" onclick="viewRecord('${r.id}')">View</button></td></tr>`).join('')}</tbody></table></div>`;
+}
+
 function recordRow(r,actions=false){
   return `<tr><td data-label="Date">${dateText(r.test_date)}</td><td data-label="Cadet"><b>${esc(r.last_name_snapshot)}, ${esc(r.first_name_snapshot)}</b><br><span class="small muted">CAPID ${esc(r.capid_snapshot)}</span></td><td data-label="Test">${esc(r.test_label_snapshot)}</td><td data-label="Score"><b>${r.raw_score}/${r.max_score}</b></td><td data-label="Status">${r.status==='draft'?'<span class="tag draft">DRAFT</span>':r.passed?'<span class="tag pass">PASS</span>':'<span class="tag fail">FAIL</span>'}</td><td data-label="Testing Officer">${esc(r.testing_officer_name)}</td><td data-label="Evaluation Unit / Activity">${esc(r.evaluation_scope_type==='unit'?scopeLabel('unit',r.evaluation_unit_id):scopeLabel('activity',r.activity_id))}</td>${actions?`<td data-label="Actions"><button class="btn btn-secondary btn-sm" onclick="viewRecord('${r.id}')">View</button></td>`:''}</tr>`;
 }
@@ -291,111 +380,158 @@ function controls(kind,shown,total,limit){
 async function renderDashboard(){
   const sc=currentScope(); $('#mainContent').innerHTML='<div class="panel loading">Loading dashboard…</div>';
   try{
-    const x=await rpc('drill_dashboard_summary',{p_scope:sc.type,p_id:sc.id}),sum=Array.isArray(x)?x[0]:x;
-    const {data,error,count}=await queryRecords(sc,true).range(0,Math.min(dashLimit,MAX_ROWS)-1); if(error)throw error;
-    $('#mainContent').innerHTML=`<div class="panel"><h2>Dashboard — ${esc(scopeLabel(sc.type,sc.id))}</h2><div class="cards"><div class="metric"><div class="num">${sum?.submitted_count||0}</div><div class="label">Submitted Tests</div></div><div class="metric"><div class="num">${sum?.passing_count||0}</div><div class="label">Passing Results</div></div><div class="metric"><div class="num">${sum?.draft_count||0}</div><div class="label">Drafts</div></div><div class="metric"><div class="num">${sum?.cadets_tested||0}</div><div class="label">Cadets Tested</div></div></div></div><div class="panel"><h2>Recent Drill Tests</h2><p class="sub">Showing ${data.length} of ${count||0} submitted tests.</p>${table(data)}${controls('dash',data.length,count||0,dashLimit)}</div>`;
-  }catch(e){err(e)}
-}
-function dashMore(){dashLimit=Math.min(MAX_ROWS,dashLimit+10);renderDashboard();}
-function dashReset(){dashLimit=10;renderDashboard();}
-function dashApply(){dashLimit=Math.max(1,Math.min(MAX_ROWS,Number($('#dashLimit').value)||10));renderDashboard();}
-async function renderRecords(){
-  const sc=currentScope(); $('#mainContent').innerHTML='<div class="panel loading">Loading records…</div>';
-  try{
-    const summaryRaw=await rpc('drill_dashboard_summary',{p_scope:sc.type,p_id:sc.id});
-    const sum=Array.isArray(summaryRaw)?summaryRaw[0]:summaryRaw;
-
-    let q=queryRecords(sc,false);
-    if(recordStatus==='draft')q=q.eq('status','draft');
-    else if(recordStatus==='submitted')q=q.eq('status','submitted');
-    else if(recordStatus==='pass')q=q.eq('status','submitted').eq('passed',true);
-    else if(recordStatus==='fail')q=q.eq('status','submitted').eq('passed',false);
-    if(recordTestFilter!=='all')q=q.eq('test_definition_id',recordTestFilter);
-
-    const fetchLimit=recordSearch?MAX_ROWS:Math.min(recordLimit,MAX_ROWS);
-    const {data,error,count}=await q.range(0,fetchLimit-1); if(error)throw error;
-
-    const needle=recordSearch.trim().toLowerCase();
-    let filtered=data||[];
-    if(needle){
-      filtered=filtered.filter(r=>[
-        r.capid_snapshot,r.first_name_snapshot,r.last_name_snapshot,
-        r.testing_officer_name,r.test_label_snapshot,r.notes
-      ].some(v=>String(v||'').toLowerCase().includes(needle)));
-    }
-    const shown=filtered.slice(0,Math.min(recordLimit,MAX_ROWS));
-    const submitted=Number(sum?.submitted_count||0),passing=Number(sum?.passing_count||0),drafts=Number(sum?.draft_count||0);
-    const failing=Math.max(0,submitted-passing);
-    const filtersActive=!!needle||recordStatus!=='all'||recordTestFilter!=='all';
-    const resultText=needle
-      ? `Showing ${shown.length} matching record${shown.length===1?'':'s'} from the newest ${Math.min(count||0,MAX_ROWS)} records in this filtered scope.`
-      : `Showing ${shown.length} of ${count||0} record${count===1?'':'s'} matching the selected filters.`;
+    const [rawSummary,submitted]=await Promise.all([
+      rpc('drill_dashboard_summary',{p_scope:sc.type,p_id:sc.id}),
+      loadSubmittedForAnalysis(sc)
+    ]);
+    const sum=Array.isArray(rawSummary)?rawSummary[0]:rawSummary;
+    const total=Number(sum?.submitted_count||submitted.length||0);
+    const passing=Number(sum?.passing_count||submitted.filter(r=>r.passed).length||0);
+    const passRate=total?Math.round(100*passing/total):0;
+    const cutoff=new Date();cutoff.setDate(cutoff.getDate()-30);
+    const recent30=submitted.filter(r=>r.test_date&&new Date(r.test_date+'T00:00:00')>=cutoff).length;
+    const ach=achievementReport(submitted).sort((a,b)=>b.attempts-a.attempts).slice(0,6);
+    const recent=submitted.slice(0,5);
+    const drafts=Number(sum?.draft_count||0);
 
     $('#mainContent').innerHTML=`
       <div class="panel">
-        <div style="display:flex;justify-content:space-between;gap:12px;align-items:end;flex-wrap:wrap">
-          <div>
-            <h2>Record Management — ${esc(scopeLabel(sc.type,sc.id))}</h2>
-            <p class="sub">Find, review, and edit individual drill-test records. Drafts live here; Reports contains only submitted tests intended for eServices entry.</p>
-          </div>
-          <button class="btn btn-primary" onclick="navigate('entry')">New Drill Test</button>
-        </div>
+        <h2>Dashboard — ${esc(scopeLabel(sc.type,sc.id))}</h2>
+        <p class="sub">Quick operational picture of drill testing. Use Records for the eServices work list and Reports for detailed analysis.</p>
         <div class="cards">
-          <div class="metric"><div class="num">${drafts}</div><div class="label">Drafts</div></div>
-          <div class="metric"><div class="num">${submitted}</div><div class="label">Submitted</div></div>
-          <div class="metric"><div class="num">${passing}</div><div class="label">Passing</div></div>
-          <div class="metric"><div class="num">${failing}</div><div class="label">Not Passing</div></div>
+          <div class="metric"><div class="num">${total}</div><div class="label">Submitted Tests</div></div>
+          <div class="metric"><div class="num">${recent30}</div><div class="label">Tests in Last 30 Days</div></div>
+          <div class="metric"><div class="num">${passRate}%</div><div class="label">Overall Pass Rate</div></div>
+          <div class="metric"><div class="num">${sum?.cadets_tested||0}</div><div class="label">Cadets Tested</div></div>
+        </div>
+        ${drafts?`<div class="alert alert-warn" style="margin-top:14px"><b>${drafts} draft${drafts===1?'':'s'}</b> currently exist in this scope and have not been submitted.</div>`:''}
+      </div>
+      <div class="grid grid-2">
+        <div class="panel">
+          <h2>Tests Given — Last 6 Months</h2>
+          <p class="sub">Submitted drill tests by test date.</p>
+          ${trendBars(monthlyTrend(submitted,6))}
+        </div>
+        <div class="panel">
+          <h2>Achievement Snapshot</h2>
+          <p class="sub">Most frequently tested achievements in the selected scope.</p>
+          ${ach.length?`<div class="table-wrap"><table class="data-table" style="min-width:520px"><thead><tr><th>Achievement</th><th>Tests</th><th>Pass Rate</th><th>Avg Score</th></tr></thead><tbody>${ach.map(a=>`<tr><td><b>${esc(a.label)}</b></td><td>${a.attempts}</td><td>${a.passRate.toFixed(0)}%</td><td>${a.avg.toFixed(1)}%</td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">No submitted drill tests yet.</div>'}
         </div>
       </div>
       <div class="panel">
-        <div class="grid grid-3">
-          <div class="field"><label>Search Records</label><input id="recordSearch" value="${esc(recordSearch)}" placeholder="Cadet, CAPID, officer, test, notes"></div>
-          <div class="field"><label>Status</label><select id="recordStatus">
-            <option value="all" ${recordStatus==='all'?'selected':''}>All records</option>
-            <option value="draft" ${recordStatus==='draft'?'selected':''}>Drafts only</option>
-            <option value="submitted" ${recordStatus==='submitted'?'selected':''}>Submitted only</option>
-            <option value="pass" ${recordStatus==='pass'?'selected':''}>Passing only</option>
-            <option value="fail" ${recordStatus==='fail'?'selected':''}>Not passing only</option>
-          </select></div>
-          <div class="field"><label>Drill Test</label><select id="recordTestFilter">
-            <option value="all">All tests</option>
-            ${tests.map(t=>`<option value="${t.id}" ${recordTestFilter===t.id?'selected':''}>${esc(t.label)}</option>`).join('')}
-          </select></div>
-        </div>
-        <div class="form-actions" style="justify-content:flex-start">
-          <button class="btn btn-primary" onclick="recordApplyFilters()">Apply Filters</button>
-          ${filtersActive?'<button class="btn btn-secondary" onclick="recordClearFilters()">Clear Filters</button>':''}
-        </div>
-        <p class="sub">${resultText}</p>
-        ${needle&&(count||0)>MAX_ROWS?`<div class="alert alert-warn">Search is limited to the newest ${MAX_ROWS} records in the selected status/test filter. Narrow the filters if you need older records.</div>`:''}
-        ${shown.length?table(shown,true):'<div class="empty">No drill-test records match these filters.</div>'}
-        ${!needle&&(count||0)>shown.length?`<div class="form-actions"><button class="btn btn-secondary" onclick="recordLimit=Math.min(${MAX_ROWS},recordLimit+25);renderRecords()" ${recordLimit>=MAX_ROWS?'disabled':''}>Show 25 More</button></div>`:''}
+        <h2>Most Recent Submitted Tests</h2>
+        ${recent.length?table(recent,false):'<div class="empty">No submitted drill tests yet.</div>'}
       </div>`;
-
-    const search=$('#recordSearch');
-    if(search)search.onkeydown=e=>{if(e.key==='Enter')recordApplyFilters();};
   }catch(e){err(e)}
 }
-function recordApplyFilters(){
-  recordSearch=$('#recordSearch')?.value.trim()||'';
-  recordStatus=$('#recordStatus')?.value||'all';
-  recordTestFilter=$('#recordTestFilter')?.value||'all';
-  recordLimit=25;
-  renderRecords();
-}
-function recordClearFilters(){
-  recordSearch=''; recordStatus='all'; recordTestFilter='all'; recordLimit=25; renderRecords();
+async function renderRecords(){
+  const sc=currentScope(); $('#mainContent').innerHTML='<div class="panel loading">Loading eServices work list…</div>';
+  try{
+    const {data,error,count}=await querySubmittedQueue(sc).range(0,Math.min(recordLimit,ANALYTICS_MAX)-1); if(error)throw error;
+    const rows=data||[];
+    $('#mainContent').innerHTML=`
+      <div class="panel">
+        <h2>Records — eServices Entry List</h2>
+        <p class="sub">Submitted drill tests for ${esc(scopeLabel(sc.type,sc.id))}, in chronological order (oldest first). This is the work list for entering completed drill tests into eServices. Drafts are not shown.</p>
+        <div class="alert alert-info"><b>${count||0} submitted test${count===1?'':'s'}</b> in this list. Work from top to bottom for a simple sequential entry workflow.</div>
+        ${rows.length?queueTable(rows):'<div class="empty">No submitted drill tests yet.</div>'}
+        ${(count||0)>rows.length?`<div class="form-actions"><button class="btn btn-secondary" onclick="recordLimit=Math.min(${ANALYTICS_MAX},recordLimit+50);renderRecords()">Show 50 More</button></div>`:''}
+      </div>`;
+  }catch(e){err(e)}
 }
 async function renderReports(){
-  const sc=currentScope(); $('#mainContent').innerHTML='<div class="panel loading">Loading Reports…</div>';
+  const sc=currentScope(); $('#mainContent').innerHTML='<div class="panel loading">Building reports…</div>';
   try{
-    const {data,error,count}=await queryRecords(sc,true).range(0,Math.min(reportLimit,MAX_ROWS)-1); if(error)throw error;
-    $('#mainContent').innerHTML=`<div class="panel"><h2>Reports — eServices Entry List</h2><p class="sub">Submitted tests only; drafts never appear here. Newest first. Showing ${data.length} of ${count||0} submitted tests for ${esc(scopeLabel(sc.type,sc.id))}.</p>${table(data,true)}${controls('report',data.length,count||0,reportLimit)}</div>`;
+    const all=await loadSubmittedForAnalysis(sc);
+    const members=new Map();
+    for(const r of all){
+      const key=recordMemberKey(r);
+      if(!members.has(key))members.set(key,{key,capid:r.capid_snapshot||'',first:r.first_name_snapshot||'',last:r.last_name_snapshot||''});
+    }
+    const memberList=[...members.values()].sort((a,b)=>(a.last+', '+a.first).localeCompare(b.last+', '+b.first));
+    const testList=[...new Map(all.map(r=>[r.test_definition_id,{id:r.test_definition_id,label:r.test_label_snapshot||r.test_code_snapshot||'Drill Test'}])).values()].sort((a,b)=>a.label.localeCompare(b.label));
+
+    let rows=all.slice();
+    if(reportMember!=='all')rows=rows.filter(r=>recordMemberKey(r)===reportMember);
+    if(reportTest!=='all')rows=rows.filter(r=>r.test_definition_id===reportTest);
+    if(reportResult==='pass')rows=rows.filter(r=>r.passed);
+    if(reportResult==='fail')rows=rows.filter(r=>!r.passed);
+    if(reportStart)rows=rows.filter(r=>r.test_date>=reportStart);
+    if(reportEnd)rows=rows.filter(r=>r.test_date<=reportEnd);
+
+    const passes=rows.filter(r=>r.passed).length;
+    const uniqueMembers=new Set(rows.map(recordMemberKey)).size;
+    const avg=rows.length?mean(rows.map(recordScorePct)):0;
+    const ach=achievementReport(rows);
+    const misses=reportMisses(rows).slice(0,15);
+
+    const memberGroups=new Map();
+    for(const r of rows){
+      const k=recordMemberKey(r),g=memberGroups.get(k)||{key:k,capid:r.capid_snapshot||'',first:r.first_name_snapshot||'',last:r.last_name_snapshot||'',rows:[]};
+      g.rows.push(r);memberGroups.set(k,g);
+    }
+    const memberSummary=[...memberGroups.values()].map(g=>{
+      const p=g.rows.filter(r=>r.passed).length;
+      return {...g,count:g.rows.length,passRate:g.rows.length?100*p/g.rows.length:0,last:g.rows.map(r=>r.test_date).sort().reverse()[0]||''};
+    }).sort((a,b)=>(a.last+', '+a.first).localeCompare(b.last+', '+b.first));
+
+    const selectedMember=reportMember!=='all'?members.get(reportMember):null;
+    const historyHtml=selectedMember
+      ? (rows.length?table(rows,true):'<div class="empty">No records match the selected filters for this member.</div>')
+      : (memberSummary.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>Member</th><th>CAPID</th><th>Tests</th><th>Pass Rate</th><th>Most Recent</th></tr></thead><tbody>${memberSummary.map(m=>`<tr><td><b>${esc(m.last)}, ${esc(m.first)}</b></td><td>${esc(m.capid)}</td><td>${m.count}</td><td>${m.passRate.toFixed(1)}%</td><td>${dateText(m.last)}</td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">No member history matches these filters.</div>');
+
+    $('#mainContent').innerHTML=`
+      <div class="panel">
+        <h2>Reports & Drill Analysis — ${esc(scopeLabel(sc.type,sc.id))}</h2>
+        <p class="sub">Review individual member history, achievement performance, scoring trends, and commands that are most often marked unsatisfactory.</p>
+        <div class="grid grid-3">
+          <div class="field"><label>Member</label><select id="reportMember"><option value="all">All members</option>${memberList.map(m=>`<option value="${esc(m.key)}" ${reportMember===m.key?'selected':''}>${esc(m.last)}, ${esc(m.first)} — ${esc(m.capid)}</option>`).join('')}</select></div>
+          <div class="field"><label>Achievement / Drill Test</label><select id="reportTest"><option value="all">All drill tests</option>${testList.map(t=>`<option value="${t.id}" ${reportTest===t.id?'selected':''}>${esc(t.label)}</option>`).join('')}</select></div>
+          <div class="field"><label>Result</label><select id="reportResult"><option value="all" ${reportResult==='all'?'selected':''}>All results</option><option value="pass" ${reportResult==='pass'?'selected':''}>Passing only</option><option value="fail" ${reportResult==='fail'?'selected':''}>Not passing only</option></select></div>
+        </div>
+        <div class="grid grid-3">
+          <div class="field"><label>From Date</label><input id="reportStart" type="date" value="${esc(reportStart)}"></div>
+          <div class="field"><label>Through Date</label><input id="reportEnd" type="date" value="${esc(reportEnd)}"></div>
+          <div class="form-actions" style="justify-content:flex-start;align-items:end"><button class="btn btn-primary" onclick="applyReportFilters()">Run Report</button><button class="btn btn-secondary" onclick="clearReportFilters()">Clear</button></div>
+        </div>
+        <div class="cards">
+          <div class="metric"><div class="num">${rows.length}</div><div class="label">Tests in Report</div></div>
+          <div class="metric"><div class="num">${rows.length?(100*passes/rows.length).toFixed(1):'0.0'}%</div><div class="label">Pass Rate</div></div>
+          <div class="metric"><div class="num">${uniqueMembers}</div><div class="label">Members Tested</div></div>
+          <div class="metric"><div class="num">${avg.toFixed(1)}%</div><div class="label">Average Score</div></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>${selectedMember?`Drill History — ${esc(selectedMember.first)} ${esc(selectedMember.last)}`:'Member Drill History'}</h2>
+        <p class="sub">${selectedMember?'Chronological record of this member’s submitted drill tests within the selected filters.':'Select a member above for their detailed drill history, or use this summary to compare activity across members.'}</p>
+        ${historyHtml}
+      </div>
+
+      <div class="panel">
+        <h2>Achievement Performance</h2>
+        <p class="sub">Passing standard, observed score range, pass rate, and the command most often missed for each drill test.</p>
+        ${ach.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>Achievement</th><th>Tests</th><th>Passing Standard</th><th>Pass Rate</th><th>Average Score</th><th>Observed Range</th><th>Most Missed Command</th></tr></thead><tbody>${ach.map(a=>`<tr><td><b>${esc(a.label)}</b></td><td>${a.attempts}</td><td>${esc(a.standard)}</td><td>${a.passRate.toFixed(1)}%</td><td>${a.avg.toFixed(1)}%</td><td>${a.min.toFixed(1)}–${a.max.toFixed(1)}%</td><td>${esc(a.mostMissed)}${a.missCount?` <span class="small muted">(${a.missCount} miss${a.missCount===1?'':'es'})</span>`:''}</td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">No achievement data matches these filters.</div>'}
+      </div>
+
+      <div class="panel">
+        <h2>Most Missed Commands</h2>
+        <p class="sub">Unsatisfactory S/U items and unearned point items, ranked by number of misses. Attempt count is shown so a high percentage from a tiny sample is easy to spot.</p>
+        ${misses.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>Achievement</th><th>Command / Item</th><th>Misses</th><th>Attempts</th><th>Miss Rate</th></tr></thead><tbody>${misses.map(m=>`<tr><td>${esc(m.test)}</td><td><b>${esc(m.command)}</b></td><td>${m.misses}</td><td>${m.attempts}</td><td>${m.rate.toFixed(1)}%</td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">No unsatisfactory / missed commands appear in the selected records.</div>'}
+      </div>`;
   }catch(e){err(e)}
 }
-function reportMore(){reportLimit=Math.min(MAX_ROWS,reportLimit+10);renderReports();}
-function reportReset(){reportLimit=10;renderReports();}
-function reportApply(){reportLimit=Math.max(1,Math.min(MAX_ROWS,Number($('#reportLimit').value)||10));renderReports();}
+function applyReportFilters(){
+  reportMember=$('#reportMember')?.value||'all';
+  reportTest=$('#reportTest')?.value||'all';
+  reportResult=$('#reportResult')?.value||'all';
+  reportStart=$('#reportStart')?.value||'';
+  reportEnd=$('#reportEnd')?.value||'';
+  renderReports();
+}
+function clearReportFilters(){
+  reportMember='all';reportTest='all';reportResult='all';reportStart='';reportEnd='';renderReports();
+}
 async function viewRecord(id){
   try{
     const {data,error}=await sb.from('drill_records').select('*').eq('id',id).single(); if(error)throw error;
