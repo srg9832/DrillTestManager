@@ -37,58 +37,136 @@ serve(async req=>{
     const body=await req.json();
     const action=String(body.action||"");
 
-    const {data:global}=await admin.from("drill_global_permissions").select("is_app_admin").eq("user_id",caller).maybeSingle();
+    const {data:global,error:globalError}=await admin.from("drill_global_permissions")
+      .select("is_app_admin").eq("user_id",caller).maybeSingle();
+    if(globalError)throw globalError;
     const appAdmin=!!global?.is_app_admin;
-    const {data:myPerms}=await admin.from("drill_unit_permissions").select("unit_id,unit_admin,revoked_at,expires_at").eq("user_id",caller);
-    const activeAdminUnits=(myPerms||[]).filter((p:any)=>p.unit_admin&&!p.revoked_at&&(!p.expires_at||new Date(p.expires_at)>=new Date())).map((p:any)=>p.unit_id);
+
+    const {data:myPerms,error:myPermsError}=await admin.from("drill_unit_permissions")
+      .select("unit_id,unit_admin,revoked_at,expires_at").eq("user_id",caller);
+    if(myPermsError)throw myPermsError;
+    const activeAdminUnits=(myPerms||[])
+      .filter((p:any)=>p.unit_admin&&!p.revoked_at&&(!p.expires_at||new Date(p.expires_at)>=new Date()))
+      .map((p:any)=>p.unit_id);
 
     if(action==="lookup_user"){
       if(!appAdmin&&!activeAdminUnits.length)return reply({error:"Unit Admin or Application Admin required"},403);
       const email=String(body.email||"").trim().toLowerCase();
+      if(!email)return reply({error:"Email is required"},400);
       const u=await findByEmail(admin,email);
       if(!u)return reply({found:false});
-      const {data:p}=await admin.from("profiles").select("id,display_name,member_id").eq("id",u.id).maybeSingle();
-      let homeUnitId=null,capid=null,firstName=null,lastName=null;
-      if(p?.member_id){
-        const {data:m}=await admin.from("members").select("capid,first_name,last_name").eq("id",p.member_id).maybeSingle();
-        capid=m?.capid||null;firstName=m?.first_name||null;lastName=m?.last_name||null;
-        const {data:a}=await admin.from("member_unit_assignments").select("unit_id").eq("member_id",p.member_id).eq("active",true).eq("is_primary",true).order("start_date",{ascending:false}).limit(1).maybeSingle();
-        homeUnitId=a?.unit_id||null;
-      }
-      return reply({found:true,userId:u.id,email:u.email,displayName:p?.display_name||[firstName,lastName].filter(Boolean).join(" ")||u.email,memberId:p?.member_id||null,capid,firstName,lastName,homeUnitId});
+
+      const [{data:p,error:pError},{data:s,error:sError}]=await Promise.all([
+        admin.from("profiles").select("id,display_name").eq("id",u.id).maybeSingle(),
+        admin.from("drill_user_settings").select("home_unit_id").eq("user_id",u.id).maybeSingle(),
+      ]);
+      if(pError)throw pError;
+      if(sError)throw sError;
+
+      return reply({
+        found:true,
+        userId:u.id,
+        email:u.email,
+        displayName:p?.display_name||u.email||"CAP User",
+        homeUnitId:s?.home_unit_id||null,
+      });
     }
 
     if(action==="ensure_user"){
       const email=String(body.email||"").trim().toLowerCase();
-      const memberId=body.memberId?String(body.memberId):null;
       const displayName=String(body.displayName||"").trim();
       const password=String(body.password||"");
-      if(!email||!memberId)return reply({error:"Email and memberId are required"},400);
+      const homeUnitId=body.homeUnitId?String(body.homeUnitId):"";
 
-      const {data:a}=await admin.from("member_unit_assignments").select("unit_id").eq("member_id",memberId).eq("active",true).eq("is_primary",true).order("start_date",{ascending:false}).limit(1).maybeSingle();
-      const home=a?.unit_id||null;
-      if(!home)return reply({error:"Target member has no active primary home unit"},400);
-      if(!appAdmin&&!activeAdminUnits.includes(home))return reply({error:"Only App Admin or the member's home Unit Admin may create/link this login"},403);
+      if(!email||!displayName||!homeUnitId){
+        return reply({error:"Display name, email, and Drill home unit are required"},400);
+      }
+
+      const {data:homeUnit,error:homeUnitError}=await admin.from("units")
+        .select("id,active").eq("id",homeUnitId).maybeSingle();
+      if(homeUnitError)throw homeUnitError;
+      if(!homeUnit?.active)return reply({error:"Valid active Drill home unit required"},400);
+
+      if(!appAdmin&&!activeAdminUnits.includes(homeUnitId)){
+        return reply({error:"You may create or authorize Drill users only for a unit you administer"},403);
+      }
 
       let u=await findByEmail(admin,email),created=false;
       if(!u){
-        if(!password)return reply({error:"Initial password required for a new account"},400);
-        const {data,error}=await admin.auth.admin.createUser({email,password,email_confirm:true,user_metadata:{display_name:displayName||email}});
-        if(error)throw error;u=data.user;created=true;
-      } else {
-        const {data:existingProfile,error:existingProfileError}=await admin.from("profiles").select("member_id").eq("id",u.id).maybeSingle();
-        if(existingProfileError)throw existingProfileError;
-        if(existingProfile?.member_id && existingProfile.member_id!==memberId){
-          return reply({error:"That login is already linked to a different CAP member. An Application Admin must resolve the existing account link before it can be reassigned."},409);
-        }
+        if(!password)return reply({error:"Initial password required for a brand-new shared account"},400);
+        const {data,error}=await admin.auth.admin.createUser({
+          email,
+          password,
+          email_confirm:true,
+          user_metadata:{display_name:displayName},
+        });
+        if(error)throw error;
+        u=data.user;
+        created=true;
       }
-      const profile:any={id:u.id,member_id:memberId}; if(displayName)profile.display_name=displayName;
-      const {error:pe}=await admin.from("profiles").upsert(profile,{onConflict:"id"}); if(pe)throw pe;
-      await admin.from("drill_global_permissions").upsert({user_id:u.id},{onConflict:"user_id"});
-      await admin.from("drill_audit_log").insert({actor_user_id:caller,action:created?"CREATE_AUTH_USER":"LINK_AUTH_USER",entity_type:"user",entity_id:u.id,target_user_id:u.id,unit_id:home,details:{email,member_id:memberId}});
-      return reply({ok:true,userId:u.id,created,email});
+
+      const [{data:existingProfile,error:profileReadError},{data:setting,error:settingError}]=await Promise.all([
+        admin.from("profiles").select("id,display_name").eq("id",u.id).maybeSingle(),
+        admin.from("drill_user_settings").select("home_unit_id").eq("user_id",u.id).maybeSingle(),
+      ]);
+      if(profileReadError)throw profileReadError;
+      if(settingError)throw settingError;
+
+      if(setting?.home_unit_id && setting.home_unit_id!==homeUnitId && !appAdmin){
+        return reply({error:"Only a Drill App Admin can move an existing Drill user to a different home unit"},409);
+      }
+
+      if(existingProfile){
+        if(appAdmin||created){
+          const {error}=await admin.from("profiles").update({display_name:displayName}).eq("id",u.id);
+          if(error)throw error;
+        }
+      }else{
+        const {error}=await admin.from("profiles").insert({
+          id:u.id,
+          display_name:displayName,
+          is_app_admin:false,
+        });
+        if(error)throw error;
+      }
+
+      if(appAdmin && !created){
+        const {error}=await admin.auth.admin.updateUserById(u.id,{
+          user_metadata:{...(u.user_metadata||{}),display_name:displayName},
+          ...(password?{password}:{})
+        });
+        if(error)throw error;
+      }
+
+      const {error:settingsError}=await admin.from("drill_user_settings").upsert({
+        user_id:u.id,
+        home_unit_id:homeUnitId,
+        updated_at:new Date().toISOString(),
+        updated_by:caller,
+      },{onConflict:"user_id"});
+      if(settingsError)throw settingsError;
+
+      const {error:globalPermError}=await admin.from("drill_global_permissions")
+        .upsert({user_id:u.id},{onConflict:"user_id"});
+      if(globalPermError)throw globalPermError;
+
+      const {error:auditError}=await admin.from("drill_audit_log").insert({
+        actor_user_id:caller,
+        action:created?"CREATE_AUTH_USER":"AUTHORIZE_DRILL_USER",
+        entity_type:"user",
+        entity_id:u.id,
+        target_user_id:u.id,
+        unit_id:homeUnitId,
+        details:{email,drill_home_unit_id:homeUnitId},
+      });
+      if(auditError)throw auditError;
+
+      return reply({ok:true,userId:u.id,created,email,homeUnitId});
     }
 
     return reply({error:"Unsupported action"},400);
-  }catch(e){console.error(e);return reply({error:e instanceof Error?e.message:String(e)},500)}
+  }catch(e){
+    console.error(e);
+    return reply({error:e instanceof Error?e.message:String(e)},500);
+  }
 });
