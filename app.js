@@ -398,12 +398,68 @@ async function saveMemberAdmin(id){
   try{await rpc('drill_upsert_member',{p_member:id||null,p_capid:$('#mCapid').value.trim(),p_first:$('#mFirst').value.trim(),p_last:$('#mLast').value.trim(),p_home:$('#mUnit').value,p_active:$('#mActive').checked});closeModal();adminMembers();toast('Member saved.');}catch(e){err(e)}
 }
 
+
+function drillAuditUser(id,rows){
+  const u=(rows||[]).find(x=>x.user_id===id);
+  if(u)return '<b>'+esc(u.display_name||u.email||'CAP User')+'</b>'+(u.email?'<br><span class="small muted">'+esc(u.email)+'</span>':'');
+  return id?'<span class="small muted">User '+esc(String(id).slice(0,8))+'…</span>':'—';
+}
+function drillAuditWhen(value){
+  return new Date(value).toLocaleString([],{month:'numeric',day:'numeric',year:'2-digit',hour:'numeric',minute:'2-digit'});
+}
+function drillAuditAction(a){
+  if(a.action==='SET_HOME_UNIT')return 'Home unit set';
+  if(a.action==='GRANT_OR_UPDATE'&&a.entity_type==='unit_permission')return 'Unit access updated';
+  if(a.action==='GRANT_OR_UPDATE'&&a.entity_type==='activity_permission')return 'Activity access updated';
+  if(a.action==='REVOKE'&&a.entity_type==='unit_permission')return 'Unit access revoked';
+  if(a.action==='REVOKE'&&a.entity_type==='activity_permission')return 'Activity access revoked';
+  if(a.action==='UPDATE'&&a.entity_type==='global_permission')return 'App permissions updated';
+  if(a.action==='CREATE_AUTH_USER')return 'Shared account created';
+  if(a.action==='AUTHORIZE_DRILL_USER'||a.action==='LINK_AUTH_USER')return 'Drill user authorized';
+  return String(a.action||'Updated').replaceAll('_',' ').toLowerCase().replace(/^./,c=>c.toUpperCase());
+}
+function drillAuditScope(a){
+  if(a.unit_id)return esc(scopeLabel('unit',a.unit_id));
+  if(a.activity_id)return esc(scopeLabel('activity',a.activity_id));
+  if(a.entity_type==='global_permission'||a.entity_type==='user')return 'Application';
+  return '—';
+}
+function drillAuditDetails(a){
+  const d=a.details||{};
+  if(a.entity_type==='global_permission'){
+    const parts=[];
+    if(d.app_admin)parts.push('App Admin');
+    if(d.manage_activities)parts.push('Manage Activities');
+    return parts.length?parts.map(x=>'<span class="tag admin">'+esc(x)+'</span>').join(' '):'<span class="small muted">No application-wide permissions</span>';
+  }
+  if(a.entity_type==='unit_permission'){
+    if(a.action==='REVOKE')return '<span class="small">'+esc(d.reason||'Unit access removed')+'</span>';
+    const role=d.unit_admin?'Unit Admin':d.data_entry?'Data Entry':'No unit access';
+    const exp=d.expires_at?' · Expires '+esc(new Date(d.expires_at).toLocaleDateString()):'';
+    return '<span class="tag">'+esc(role)+'</span><span class="small muted">'+exp+'</span>';
+  }
+  if(a.entity_type==='activity_permission'){
+    if(a.action==='REVOKE')return '<span class="small">'+esc(d.reason||'Activity access removed')+'</span>';
+    const role=d.activity_admin?'Activity Admin':d.data_entry?'Data Entry':'No activity access';
+    const exp=d.expires_at?' · Expires '+esc(new Date(d.expires_at).toLocaleDateString()):'';
+    return '<span class="tag">'+esc(role)+'</span><span class="small muted">'+exp+'</span>';
+  }
+  if(a.entity_type==='drill_user_settings'){
+    const oldLabel=d.old_home_unit?scopeLabel('unit',d.old_home_unit):'Not set';
+    const newLabel=d.new_home_unit?scopeLabel('unit',d.new_home_unit):'Not set';
+    return '<span class="small">'+esc(oldLabel)+' → <b>'+esc(newLabel)+'</b></span>';
+  }
+  if(a.entity_type==='user')return '<span class="small">Shared CAP Applications login authorized for Drill</span>';
+  if(d.reason)return '<span class="small">'+esc(d.reason)+'</span>';
+  return '<span class="small muted">—</span>';
+}
+
 async function adminUsers(){
   try{
     const rows=await rpc('drill_admin_directory');
     const audit=await rpc('drill_permission_audit');
     const {data:unitPerms,error:upe}=await sb.from('drill_unit_permissions').select('*'); if(upe)throw upe;
-    $('#adminBody').innerHTML=`<div class="form-actions" style="justify-content:flex-start"><button class="btn btn-primary" onclick="newUser()">Add / Authorize User</button>${unitAdminIds().length?'<button class="btn btn-secondary" onclick="grantVisitor()">Grant Temporary Cross-Unit Access</button>':''}</div><div class="table-wrap"><table class="data-table"><thead><tr><th>User</th><th>Home Unit</th><th>Permissions</th><th></th></tr></thead><tbody>${rows.map(u=>{const ps=(unitPerms||[]).filter(p=>p.user_id===u.user_id&&!p.revoked_at&&(!p.expires_at||new Date(p.expires_at)>=new Date()));return `<tr><td><b>${esc(u.display_name)}</b><br><span class="small muted">${esc(u.email)}</span></td><td>${u.home_unit_id?esc(scopeLabel('unit',u.home_unit_id)):'<span class="tag draft">HOME UNIT NOT SET</span><br><span class="small muted">Assign a Drill Home Unit before adding unit permissions.</span>'}</td><td>${u.is_app_admin?'<span class="tag admin">APP ADMIN</span> ':''}${u.manage_activities?'<span class="tag admin">CREATE ACTIVITIES</span> ':''}${ps.map(p=>`<span class="tag">${esc(scopeLabel('unit',p.unit_id))}: ${p.unit_admin?'Unit Admin':'Data Entry'}${p.expires_at?` • exp ${new Date(p.expires_at).toLocaleDateString()}`:''}</span>`).join(' ')||'—'}</td><td><button class="btn btn-secondary btn-sm" onclick="manageUser('${u.user_id}','${u.home_unit_id||''}')">Manage</button></td></tr>`}).join('')}</tbody></table></div><div class="section-title">Recent Permission Audit</div><div class="table-wrap"><table class="data-table"><thead><tr><th>Time</th><th>Action</th><th>Target</th><th>Scope</th><th>Details</th></tr></thead><tbody>${(audit||[]).slice(0,40).map(a=>`<tr><td>${new Date(a.created_at).toLocaleString()}</td><td>${esc(a.action)}</td><td>${esc(a.target_user_id||'')}</td><td>${a.unit_id?esc(scopeLabel('unit',a.unit_id)):a.activity_id?esc(scopeLabel('activity',a.activity_id)):'—'}</td><td class="small">${esc(JSON.stringify(a.details||{}))}</td></tr>`).join('')}</tbody></table></div>`;
+    $('#adminBody').innerHTML=`<div class="form-actions" style="justify-content:flex-start"><button class="btn btn-primary" onclick="newUser()">Add / Authorize User</button>${unitAdminIds().length?'<button class="btn btn-secondary" onclick="grantVisitor()">Grant Temporary Cross-Unit Access</button>':''}</div><div class="table-wrap"><table class="data-table"><thead><tr><th>User</th><th>Home Unit</th><th>Permissions</th><th></th></tr></thead><tbody>${rows.map(u=>{const ps=(unitPerms||[]).filter(p=>p.user_id===u.user_id&&!p.revoked_at&&(!p.expires_at||new Date(p.expires_at)>=new Date()));return `<tr><td><b>${esc(u.display_name)}</b><br><span class="small muted">${esc(u.email)}</span></td><td>${u.home_unit_id?esc(scopeLabel('unit',u.home_unit_id)):'<span class="tag draft">HOME UNIT NOT SET</span><br><span class="small muted">Assign a Drill Home Unit before adding unit permissions.</span>'}</td><td>${u.is_app_admin?'<span class="tag admin">APP ADMIN</span> ':''}${u.manage_activities?'<span class="tag admin">CREATE ACTIVITIES</span> ':''}${ps.map(p=>`<span class="tag">${esc(scopeLabel('unit',p.unit_id))}: ${p.unit_admin?'Unit Admin':'Data Entry'}${p.expires_at?` • exp ${new Date(p.expires_at).toLocaleDateString()}`:''}</span>`).join(' ')||'—'}</td><td><button class="btn btn-secondary btn-sm" onclick="manageUser('${u.user_id}','${u.home_unit_id||''}')">Manage</button></td></tr>`}).join('')}</tbody></table></div><div class="section-title">Recent Permission Audit</div><div class="table-wrap"><table class="data-table"><thead><tr><th>Time</th><th>User</th><th>Change</th><th>Scope</th><th>Details</th></tr></thead><tbody>${(audit||[]).slice(0,40).map(a=>'<tr><td style="white-space:nowrap">'+drillAuditWhen(a.created_at)+'</td><td>'+drillAuditUser(a.target_user_id,rows)+'</td><td><b>'+esc(drillAuditAction(a))+'</b></td><td>'+drillAuditScope(a)+'</td><td>'+drillAuditDetails(a)+'</td></tr>').join('')}</tbody></table></div>`;
   }catch(e){err(e)}
 }
 function newUser(){
