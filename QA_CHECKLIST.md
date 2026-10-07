@@ -77,10 +77,13 @@ Complete this after database migration, Edge Function deployment, and GitHub dep
 
 ## User and permission administration
 - [ ] Home Unit Admin can create/link a login for a member of their unit.
+- [ ] Shared Auth users appear in the Application Admin directory.
+- [ ] An unlinked shared login is clearly marked and cannot receive unit permissions until linked to a CAPID/home unit.
 - [ ] Unit Admin can assign Data Entry in their unit.
 - [ ] Unit Admin can assign Unit Admin in their own unit.
 - [ ] Home Unit Admin cannot directly grant another unit's permission.
 - [ ] Application Admin can assign Drill App Admin.
+- [ ] Application prevents removal of the last Drill App Admin.
 - [ ] Application Admin can assign Create / Manage Other Activities.
 - [ ] Application Admin can assign activity Data Entry / Activity Admin.
 
