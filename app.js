@@ -14,6 +14,9 @@ let editingRecord = null;
 let dashLimit = 10;
 let reportLimit = 10;
 let recordLimit = 25;
+let recordSearch = '';
+let recordStatus = 'all';
+let recordTestFilter = 'all';
 let statsMode = 'officer';
 const MAX_ROWS = 250;
 
@@ -152,7 +155,7 @@ async function changeScope(v){
   try{
     await rpc('drill_set_user_preference',{p_scope:type,p_id:id});
     ctx.defaultScopeType=type; ctx.defaultUnitId=type==='unit'?id:null; ctx.defaultActivityId=type==='activity'?id:null;
-    dashLimit=10; reportLimit=10; recordLimit=25; editingRecord=null;
+    dashLimit=10; reportLimit=10; recordLimit=25; recordSearch=''; recordStatus='all'; recordTestFilter='all'; editingRecord=null;
     renderHeader(); navigate(view);
   }catch(e){err(e)}
 }
@@ -299,15 +302,95 @@ function dashApply(){dashLimit=Math.max(1,Math.min(MAX_ROWS,Number($('#dashLimit
 async function renderRecords(){
   const sc=currentScope(); $('#mainContent').innerHTML='<div class="panel loading">Loading records…</div>';
   try{
-    const {data,error,count}=await queryRecords(sc,false).range(0,Math.min(recordLimit,MAX_ROWS)-1); if(error)throw error;
-    $('#mainContent').innerHTML=`<div class="panel"><h2>Records — ${esc(scopeLabel(sc.type,sc.id))}</h2><p class="sub">Every record for this unit/activity that your role is authorized to see. Unit views also include the unit's cadets who were tested at Other Activities.</p>${table(data,true)}${count>data.length?`<div class="form-actions"><button class="btn btn-secondary" onclick="recordLimit=Math.min(${MAX_ROWS},recordLimit+25);renderRecords()">Show 25 More</button></div>`:''}</div>`;
+    const summaryRaw=await rpc('drill_dashboard_summary',{p_scope:sc.type,p_id:sc.id});
+    const sum=Array.isArray(summaryRaw)?summaryRaw[0]:summaryRaw;
+
+    let q=queryRecords(sc,false);
+    if(recordStatus==='draft')q=q.eq('status','draft');
+    else if(recordStatus==='submitted')q=q.eq('status','submitted');
+    else if(recordStatus==='pass')q=q.eq('status','submitted').eq('passed',true);
+    else if(recordStatus==='fail')q=q.eq('status','submitted').eq('passed',false);
+    if(recordTestFilter!=='all')q=q.eq('test_definition_id',recordTestFilter);
+
+    const fetchLimit=recordSearch?MAX_ROWS:Math.min(recordLimit,MAX_ROWS);
+    const {data,error,count}=await q.range(0,fetchLimit-1); if(error)throw error;
+
+    const needle=recordSearch.trim().toLowerCase();
+    let filtered=data||[];
+    if(needle){
+      filtered=filtered.filter(r=>[
+        r.capid_snapshot,r.first_name_snapshot,r.last_name_snapshot,
+        r.testing_officer_name,r.test_label_snapshot,r.notes
+      ].some(v=>String(v||'').toLowerCase().includes(needle)));
+    }
+    const shown=filtered.slice(0,Math.min(recordLimit,MAX_ROWS));
+    const submitted=Number(sum?.submitted_count||0),passing=Number(sum?.passing_count||0),drafts=Number(sum?.draft_count||0);
+    const failing=Math.max(0,submitted-passing);
+    const filtersActive=!!needle||recordStatus!=='all'||recordTestFilter!=='all';
+    const resultText=needle
+      ? `Showing ${shown.length} matching record${shown.length===1?'':'s'} from the newest ${Math.min(count||0,MAX_ROWS)} records in this filtered scope.`
+      : `Showing ${shown.length} of ${count||0} record${count===1?'':'s'} matching the selected filters.`;
+
+    $('#mainContent').innerHTML=`
+      <div class="panel">
+        <div style="display:flex;justify-content:space-between;gap:12px;align-items:end;flex-wrap:wrap">
+          <div>
+            <h2>Record Management — ${esc(scopeLabel(sc.type,sc.id))}</h2>
+            <p class="sub">Find, review, and edit individual drill-test records. Drafts live here; Reports contains only submitted tests intended for eServices entry.</p>
+          </div>
+          <button class="btn btn-primary" onclick="navigate('entry')">New Drill Test</button>
+        </div>
+        <div class="cards">
+          <div class="metric"><div class="num">${drafts}</div><div class="label">Drafts</div></div>
+          <div class="metric"><div class="num">${submitted}</div><div class="label">Submitted</div></div>
+          <div class="metric"><div class="num">${passing}</div><div class="label">Passing</div></div>
+          <div class="metric"><div class="num">${failing}</div><div class="label">Not Passing</div></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="grid grid-3">
+          <div class="field"><label>Search Records</label><input id="recordSearch" value="${esc(recordSearch)}" placeholder="Cadet, CAPID, officer, test, notes"></div>
+          <div class="field"><label>Status</label><select id="recordStatus">
+            <option value="all" ${recordStatus==='all'?'selected':''}>All records</option>
+            <option value="draft" ${recordStatus==='draft'?'selected':''}>Drafts only</option>
+            <option value="submitted" ${recordStatus==='submitted'?'selected':''}>Submitted only</option>
+            <option value="pass" ${recordStatus==='pass'?'selected':''}>Passing only</option>
+            <option value="fail" ${recordStatus==='fail'?'selected':''}>Not passing only</option>
+          </select></div>
+          <div class="field"><label>Drill Test</label><select id="recordTestFilter">
+            <option value="all">All tests</option>
+            ${tests.map(t=>`<option value="${t.id}" ${recordTestFilter===t.id?'selected':''}>${esc(t.label)}</option>`).join('')}
+          </select></div>
+        </div>
+        <div class="form-actions" style="justify-content:flex-start">
+          <button class="btn btn-primary" onclick="recordApplyFilters()">Apply Filters</button>
+          ${filtersActive?'<button class="btn btn-secondary" onclick="recordClearFilters()">Clear Filters</button>':''}
+        </div>
+        <p class="sub">${resultText}</p>
+        ${needle&&(count||0)>MAX_ROWS?`<div class="alert alert-warn">Search is limited to the newest ${MAX_ROWS} records in the selected status/test filter. Narrow the filters if you need older records.</div>`:''}
+        ${shown.length?table(shown,true):'<div class="empty">No drill-test records match these filters.</div>'}
+        ${!needle&&(count||0)>shown.length?`<div class="form-actions"><button class="btn btn-secondary" onclick="recordLimit=Math.min(${MAX_ROWS},recordLimit+25);renderRecords()" ${recordLimit>=MAX_ROWS?'disabled':''}>Show 25 More</button></div>`:''}
+      </div>`;
+
+    const search=$('#recordSearch');
+    if(search)search.onkeydown=e=>{if(e.key==='Enter')recordApplyFilters();};
   }catch(e){err(e)}
+}
+function recordApplyFilters(){
+  recordSearch=$('#recordSearch')?.value.trim()||'';
+  recordStatus=$('#recordStatus')?.value||'all';
+  recordTestFilter=$('#recordTestFilter')?.value||'all';
+  recordLimit=25;
+  renderRecords();
+}
+function recordClearFilters(){
+  recordSearch=''; recordStatus='all'; recordTestFilter='all'; recordLimit=25; renderRecords();
 }
 async function renderReports(){
   const sc=currentScope(); $('#mainContent').innerHTML='<div class="panel loading">Loading Reports…</div>';
   try{
     const {data,error,count}=await queryRecords(sc,true).range(0,Math.min(reportLimit,MAX_ROWS)-1); if(error)throw error;
-    $('#mainContent').innerHTML=`<div class="panel"><h2>Reports — eServices Entry List</h2><p class="sub">Newest first. Showing ${data.length} of ${count||0} submitted tests for ${esc(scopeLabel(sc.type,sc.id))}.</p>${table(data,true)}${controls('report',data.length,count||0,reportLimit)}</div>`;
+    $('#mainContent').innerHTML=`<div class="panel"><h2>Reports — eServices Entry List</h2><p class="sub">Submitted tests only; drafts never appear here. Newest first. Showing ${data.length} of ${count||0} submitted tests for ${esc(scopeLabel(sc.type,sc.id))}.</p>${table(data,true)}${controls('report',data.length,count||0,reportLimit)}</div>`;
   }catch(e){err(e)}
 }
 function reportMore(){reportLimit=Math.min(MAX_ROWS,reportLimit+10);renderReports();}
