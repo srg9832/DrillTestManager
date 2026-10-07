@@ -40,7 +40,8 @@ CAP-Drill-Test-Production/
 - `public.units`
 - `public.members`
 - `public.member_unit_assignments`
-- `profiles.member_id`
+- `profiles.member_id` (shared member metadata only; not used for Drill login authorization)
+- `drill_user_settings.home_unit_id` (Drill-specific login home unit)
 
 The migration is additive. It does **not** delete or replace CAP Schedule or Leadership Feedback tables.
 
