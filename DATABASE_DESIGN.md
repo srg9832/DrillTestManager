@@ -9,11 +9,18 @@ The Drill application reuses the same Supabase project and shared CAP objects al
 - `units` — CAP units
 - `members` — organization-wide member roster
 - `member_unit_assignments` — current and historical member-to-unit assignments
-- `profiles.member_id` — optional link from a login account to the member roster
+- `profiles.member_id` — may be used by other CAP applications, but Drill login permissions do not depend on it
 
-`members.capid` remains the human/business lookup key. Database relationships use the member UUID so correcting a CAPID later does not require rewriting every drill record.
+`members.capid` remains the human/business lookup key for the cadet/member being tested. Drill login authorization is separate: `drill_user_settings.home_unit_id` stores the login's Drill Home Unit for permission ownership and borrowed-access rules.
 
 ## Drill-specific tables
+
+### `drill_user_settings`
+Drill-only login metadata:
+- `user_id` — the shared Supabase Auth login;
+- `home_unit_id` — the user's Drill Home Unit.
+
+This is intentionally independent from CAPID and `profiles.member_id`. A person may have a shared login and also appear separately in the evaluated-member roster without the two records being linked for Drill authorization.
 
 ### `drill_global_permissions`
 Application-wide Drill permissions:
@@ -101,7 +108,7 @@ Authorization rules:
 4. Application Admin may manage everything.
 5. Expired permissions stop working at authorization time; no cleanup job is required.
 
-The member's home unit is resolved server-side from `profiles.member_id` and the active primary `member_unit_assignments` row. A browser-supplied home unit is never trusted for permission decisions.
+The login's home unit is resolved server-side from `drill_user_settings.home_unit_id`. CAPID/member-roster linkage is not used for login authorization. A browser-supplied home unit is never trusted for permission decisions.
 
 ## Unit and activity roll-up
 
