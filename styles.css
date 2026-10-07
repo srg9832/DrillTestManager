@@ -44,3 +44,11 @@ dialog{border:0;border-radius:14px;box-shadow:0 20px 70px rgba(0,0,0,.3);width:m
   .data-table.mobile-card-table td{border:0;padding:4px 2px}
   .data-table.mobile-card-table td:before{content:attr(data-label);font-weight:700;margin-right:6px;color:#3f5365}
 }
+
+.trend-chart{display:flex;flex-direction:column;gap:10px;margin-top:12px}
+.trend-row{display:grid;grid-template-columns:64px minmax(120px,1fr) 120px;gap:10px;align-items:center}
+.trend-label{font-size:12px;font-weight:800;color:#506779}
+.trend-track{height:18px;border-radius:999px;background:#edf2f6;overflow:hidden;border:1px solid #e1e7ec}
+.trend-fill{height:100%;background:var(--blue);border-radius:999px}
+.trend-value{font-size:12px;color:var(--ink);white-space:nowrap}
+@media(max-width:700px){.trend-row{grid-template-columns:54px minmax(80px,1fr) 92px}.trend-value .muted{display:none}}
