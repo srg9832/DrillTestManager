@@ -5,6 +5,7 @@ const sb = configured ? window.supabase.createClient(CFG.supabaseUrl, CFG.supaba
 let me = null;
 let ctx = null;
 let sharedProfile = null;
+let passwordChangeInProgress = false;
 let units = [];
 let activities = [];
 let tests = [];
@@ -198,6 +199,7 @@ async function savePassword(e){
   try{
     if(p.length<8)throw new Error('New password must be at least 8 characters.');
     if(p!==c)throw new Error('Passwords do not match.');
+    passwordChangeInProgress=true;
     const {error}=await sb.auth.updateUser({password:p});if(error)throw error;
     const {error:profileError}=await sb.rpc('shared_complete_password_change');if(profileError)throw profileError;
     if(sharedProfile)sharedProfile.must_change_password=false;
@@ -205,6 +207,8 @@ async function savePassword(e){
     toast('Password changed for your shared CAP Applications account.');
   }catch(e){
     $('#passwordError').textContent=e?.message||String(e);$('#passwordError').classList.remove('hidden');
+  }finally{
+    passwordChangeInProgress=false;
   }
 }
 function navigate(v){
@@ -852,7 +856,8 @@ $('#passwordDialog').addEventListener('cancel',e=>{if($('#passwordDialog').datas
 $('#defaultScope').onchange=e=>changeScope(e.target.value);
 
 if(sb){
-  sb.auth.onAuthStateChange(async (_event,session)=>{
+  sb.auth.onAuthStateChange(async (event,session)=>{
+    if(event==='USER_UPDATED'&&passwordChangeInProgress)return;
     if(session?.user){
       try{await loadCore();showApp();}catch(e){err(e);}
     }else{
