@@ -4,6 +4,7 @@ const sb = configured ? window.supabase.createClient(CFG.supabaseUrl, CFG.supaba
 
 let me = null;
 let ctx = null;
+let sharedProfile = null;
 let units = [];
 let activities = [];
 let tests = [];
@@ -133,6 +134,9 @@ async function loadCore(){
   const {data:{user}}=await sb.auth.getUser();
   me=user; if(!user) return;
   ctx=await rpc('drill_get_my_context');
+  const profileResult=await sb.from('profiles').select('must_change_password').eq('id',user.id).maybeSingle();
+  if(profileResult.error)throw profileResult.error;
+  sharedProfile=profileResult.data||{must_change_password:false};
   let q=await sb.from('units').select('id,charter_number,name,active').order('charter_number');
   if(q.error) throw q.error; units=q.data||[];
   q=await sb.from('drill_activities').select('*').order('start_date',{ascending:false});
@@ -168,6 +172,40 @@ function renderNav(){
 function showApp(){
   $('#loginScreen').classList.add('hidden'); $('#app').classList.remove('hidden');
   renderHeader(); renderNav(); navigate('entry');
+  if(sharedProfile?.must_change_password)setTimeout(()=>openPasswordDialog(true),0);
+}
+
+function openPasswordDialog(force=false){
+  const d=$('#passwordDialog');if(!d)return;
+  d.dataset.force=force?'true':'false';
+  $('#passwordDialogTitle').textContent=force?'Change Temporary Password':'Change Password';
+  $('#passwordDialogHelp').textContent=force
+    ? 'This is your first sign-in with a temporary password. Choose your own password before continuing.'
+    : 'This password is shared across CAP Schedule, Leadership Feedback, Drill Tests, and Uniform Inspections.';
+  $('#passwordCloseBtn').classList.toggle('hidden',force);
+  $('#passwordCancelBtn').classList.toggle('hidden',force);
+  $('#newPassword').value='';$('#confirmPassword').value='';
+  $('#passwordError').classList.add('hidden');$('#passwordError').textContent='';
+  d.showModal();setTimeout(()=>$('#newPassword').focus(),0);
+}
+function closePasswordDialog(){
+  const d=$('#passwordDialog');if(!d||d.dataset.force==='true')return;d.close();
+}
+async function savePassword(e){
+  e.preventDefault();
+  const p=$('#newPassword').value,c=$('#confirmPassword').value;
+  $('#passwordError').classList.add('hidden');$('#passwordError').textContent='';
+  try{
+    if(p.length<8)throw new Error('New password must be at least 8 characters.');
+    if(p!==c)throw new Error('Passwords do not match.');
+    const {error}=await sb.auth.updateUser({password:p});if(error)throw error;
+    const {error:profileError}=await sb.rpc('shared_complete_password_change');if(profileError)throw profileError;
+    if(sharedProfile)sharedProfile.must_change_password=false;
+    $('#passwordDialog').dataset.force='false';$('#passwordDialog').close();
+    toast('Password changed for your shared CAP Applications account.');
+  }catch(e){
+    $('#passwordError').textContent=e?.message||String(e);$('#passwordError').classList.remove('hidden');
+  }
 }
 function navigate(v){
   view=v; renderNav();
@@ -806,6 +844,11 @@ async function saveTest(id){
 $('#loginBtn').onclick=login;
 $('#loginPassword').onkeydown=e=>{if(e.key==='Enter')login();};
 $('#logoutBtn').onclick=logout;
+$('#changePasswordBtn').onclick=()=>openPasswordDialog(false);
+$('#passwordCloseBtn').onclick=closePasswordDialog;
+$('#passwordCancelBtn').onclick=closePasswordDialog;
+$('#passwordForm').onsubmit=savePassword;
+$('#passwordDialog').addEventListener('cancel',e=>{if($('#passwordDialog').dataset.force==='true')e.preventDefault()});
 $('#defaultScope').onchange=e=>changeScope(e.target.value);
 
 if(sb){
@@ -813,7 +856,7 @@ if(sb){
     if(session?.user){
       try{await loadCore();showApp();}catch(e){err(e);}
     }else{
-      me=null;ctx=null;$('#app').classList.add('hidden');$('#loginScreen').classList.remove('hidden');
+      me=null;ctx=null;sharedProfile=null;$('#app').classList.add('hidden');$('#loginScreen').classList.remove('hidden');
     }
   });
 }
