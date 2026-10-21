@@ -118,7 +118,9 @@ serve(async req=>{
 
       if(existingProfile){
         if(appAdmin||created){
-          const {error}=await admin.from("profiles").update({display_name:displayName}).eq("id",u.id);
+          const profilePatch:any={display_name:displayName};
+          if(password&&!created)profilePatch.must_change_password=true;
+          const {error}=await admin.from("profiles").update(profilePatch).eq("id",u.id);
           if(error)throw error;
         }
       }else{
