@@ -339,6 +339,22 @@ async function loadSubmittedForAnalysis(sc,max=ANALYTICS_MAX){
   }
   return out;
 }
+const DRILL_RANKS={
+  'ACH-1':'C/Amn',
+  'ACH-2':'C/A1C',
+  'ACH-3':'C/SrA',
+  'WBA-2':'C/SSgt',
+  'ACH-4':'C/TSgt',
+  'ACH-5':'C/MSgt',
+  'ACH-6':'C/SMSgt',
+  'ACH-7':'C/CMSgt',
+  'ACH-8':'C/CMSgt Ghost'
+};
+function rankedDrillLabel(label,code){
+  const rank=DRILL_RANKS[String(code||'').toUpperCase()];
+  const base=String(label||code||'Drill Test').replace(/\s+\(C\/(?:Amn|A1C|SrA|SSgt|TSgt|MSgt|SMSgt|CMSgt(?: Ghost)?)\)$/i,'');
+  return rank?`${base} (${rank})`:base;
+}
 function recordMemberKey(r){return r.subject_member_id||('capid:'+String(r.capid_snapshot||''));}
 function recordScorePct(r){return r.max_score?100*Number(r.raw_score||0)/Number(r.max_score):0;}
 function passingStandard(r){
@@ -355,7 +371,7 @@ function reportMisses(rows){
       const item=items.get(String(itemId))||{};
       const command=item.command||('Item '+itemId);
       const key=[r.test_definition_id,itemId,command].join('|');
-      const x=map.get(key)||{testId:r.test_definition_id,test:r.test_label_snapshot||r.test_code_snapshot||'Drill Test',itemId,command,attempts:0,misses:0};
+      const x=map.get(key)||{testId:r.test_definition_id,test:rankedDrillLabel(r.test_label_snapshot,r.test_code_snapshot),itemId,command,attempts:0,misses:0};
       x.attempts++;
       if(value==='U'||value===false)x.misses++;
       map.set(key,x);
@@ -368,7 +384,7 @@ function achievementReport(rows){
   const groups=new Map();
   for(const r of rows){
     const key=r.test_definition_id||r.test_label_snapshot;
-    const g=groups.get(key)||{id:key,label:r.test_label_snapshot||r.test_code_snapshot||'Drill Test',rows:[]};
+    const g=groups.get(key)||{id:key,label:rankedDrillLabel(r.test_label_snapshot,r.test_code_snapshot),rows:[]};
     g.rows.push(r);groups.set(key,g);
   }
   return [...groups.values()].map(g=>{
@@ -406,11 +422,11 @@ function trendBars(points){
   }).join('')+'</div>';
 }
 function queueTable(rows,startIndex=0){
-  return `<div class="table-wrap"><table class="data-table mobile-card-table"><thead><tr><th>#</th><th>Date</th><th>Cadet</th><th>Drill Test</th><th>Score</th><th>Result</th><th>Testing Officer</th><th></th></tr></thead><tbody>${rows.map((r,i)=>`<tr><td data-label="#">${startIndex+i+1}</td><td data-label="Date">${dateText(r.test_date)}</td><td data-label="Cadet"><b>${esc(r.last_name_snapshot)}, ${esc(r.first_name_snapshot)}</b><br><span class="small muted">CAPID ${esc(r.capid_snapshot)}</span></td><td data-label="Drill Test">${esc(r.test_label_snapshot)}</td><td data-label="Score"><b>${r.raw_score}/${r.max_score}</b></td><td data-label="Result">${r.passed?'<span class="tag pass">PASS</span>':'<span class="tag fail">FAIL</span>'}</td><td data-label="Testing Officer">${esc(r.testing_officer_name)}</td><td><button class="btn btn-secondary btn-sm" onclick="viewRecord('${r.id}')">View</button></td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table class="data-table mobile-card-table"><thead><tr><th>#</th><th>Date</th><th>Cadet</th><th>Drill Test</th><th>Score</th><th>Result</th><th>Testing Officer</th><th></th></tr></thead><tbody>${rows.map((r,i)=>`<tr><td data-label="#">${startIndex+i+1}</td><td data-label="Date">${dateText(r.test_date)}</td><td data-label="Cadet"><b>${esc(r.last_name_snapshot)}, ${esc(r.first_name_snapshot)}</b><br><span class="small muted">CAPID ${esc(r.capid_snapshot)}</span></td><td data-label="Drill Test">${esc(rankedDrillLabel(r.test_label_snapshot,r.test_code_snapshot))}</td><td data-label="Score"><b>${r.raw_score}/${r.max_score}</b></td><td data-label="Result">${r.passed?'<span class="tag pass">PASS</span>':'<span class="tag fail">FAIL</span>'}</td><td data-label="Testing Officer">${esc(r.testing_officer_name)}</td><td><button class="btn btn-secondary btn-sm" onclick="viewRecord('${r.id}')">View</button></td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function recordRow(r,actions=false){
-  return `<tr><td data-label="Date">${dateText(r.test_date)}</td><td data-label="Cadet"><b>${esc(r.last_name_snapshot)}, ${esc(r.first_name_snapshot)}</b><br><span class="small muted">CAPID ${esc(r.capid_snapshot)}</span></td><td data-label="Test">${esc(r.test_label_snapshot)}</td><td data-label="Score"><b>${r.raw_score}/${r.max_score}</b></td><td data-label="Status">${r.status==='draft'?'<span class="tag draft">DRAFT</span>':r.passed?'<span class="tag pass">PASS</span>':'<span class="tag fail">FAIL</span>'}</td><td data-label="Testing Officer">${esc(r.testing_officer_name)}</td><td data-label="Evaluation Unit / Activity">${esc(r.evaluation_scope_type==='unit'?scopeLabel('unit',r.evaluation_unit_id):scopeLabel('activity',r.activity_id))}</td>${actions?`<td data-label="Actions"><button class="btn btn-secondary btn-sm" onclick="viewRecord('${r.id}')">View</button></td>`:''}</tr>`;
+  return `<tr><td data-label="Date">${dateText(r.test_date)}</td><td data-label="Cadet"><b>${esc(r.last_name_snapshot)}, ${esc(r.first_name_snapshot)}</b><br><span class="small muted">CAPID ${esc(r.capid_snapshot)}</span></td><td data-label="Test">${esc(rankedDrillLabel(r.test_label_snapshot,r.test_code_snapshot))}</td><td data-label="Score"><b>${r.raw_score}/${r.max_score}</b></td><td data-label="Status">${r.status==='draft'?'<span class="tag draft">DRAFT</span>':r.passed?'<span class="tag pass">PASS</span>':'<span class="tag fail">FAIL</span>'}</td><td data-label="Testing Officer">${esc(r.testing_officer_name)}</td><td data-label="Evaluation Unit / Activity">${esc(r.evaluation_scope_type==='unit'?scopeLabel('unit',r.evaluation_unit_id):scopeLabel('activity',r.activity_id))}</td>${actions?`<td data-label="Actions"><button class="btn btn-secondary btn-sm" onclick="viewRecord('${r.id}')">View</button></td>`:''}</tr>`;
 }
 function table(rows,actions=false){
   return `<div class="table-wrap"><table class="data-table mobile-card-table"><thead><tr><th>Date</th><th>Cadet</th><th>Test</th><th>Score</th><th>Status</th><th>Testing Officer</th><th>Evaluation Unit / Activity</th>${actions?'<th></th>':''}</tr></thead><tbody>${rows.map(r=>recordRow(r,actions)).join('')}</tbody></table></div>`;
@@ -491,7 +507,7 @@ async function renderReports(){
       if(!members.has(key))members.set(key,{key,capid:r.capid_snapshot||'',first:r.first_name_snapshot||'',last:r.last_name_snapshot||''});
     }
     const memberList=[...members.values()].sort((a,b)=>(a.last+', '+a.first).localeCompare(b.last+', '+b.first));
-    const testList=[...new Map(all.map(r=>[r.test_definition_id,{id:r.test_definition_id,label:r.test_label_snapshot||r.test_code_snapshot||'Drill Test'}])).values()].sort((a,b)=>a.label.localeCompare(b.label));
+    const testList=[...new Map(all.map(r=>[r.test_definition_id,{id:r.test_definition_id,label:rankedDrillLabel(r.test_label_snapshot,r.test_code_snapshot)}])).values()].sort((a,b)=>a.label.localeCompare(b.label));
 
     let rows=all.slice();
     if(reportMember!=='all')rows=rows.filter(r=>recordMemberKey(r)===reportMember);
@@ -580,7 +596,7 @@ async function viewRecord(id){
     let canEdit=false; try{canEdit=!!(await rpc('can_edit_drill_record',{p_id:id}));}catch{}
     const itemMap=new Map((data.test_items_snapshot||[]).map(i=>[String(i.id),i]));
     const resultRows=Object.entries(data.results||{}).map(([k,v])=>{const it=itemMap.get(k);return `<tr><td>${esc(k)}</td><td>${esc(it?.command||'')}</td><td>${v===true?'Earned':v===false?'Not earned':esc(v)}</td></tr>`}).join('');
-    openModal('Drill Test Record',`<div class="grid grid-3"><div><b>Cadet</b><br>${esc(data.first_name_snapshot)} ${esc(data.last_name_snapshot)}<br>CAPID ${esc(data.capid_snapshot)}</div><div><b>${esc(data.test_label_snapshot)}</b><br>${esc(data.test_topic_snapshot||'')}</div><div><b>${dateText(data.test_date)}</b><br>${data.passed?'PASS':'FAIL'} — ${data.raw_score}/${data.max_score}</div></div><div class="section-title">Testing Officer</div><div>${esc(data.testing_officer_name)}</div>${resultRows?`<div class="section-title">Scoring</div><div class="table-wrap"><table class="data-table"><thead><tr><th>#</th><th>Item</th><th>Result</th></tr></thead><tbody>${resultRows}</tbody></table></div>`:''}${data.notes?`<div class="section-title">Notes</div><div>${esc(data.notes)}</div>`:''}`,`${canEdit?`<button class="btn btn-primary" onclick="editRecord('${id}')">Edit Record</button>`:''}<button class="btn btn-secondary" onclick="closeModal()">Close</button>`);
+    openModal('Drill Test Record',`<div class="grid grid-3"><div><b>Cadet</b><br>${esc(data.first_name_snapshot)} ${esc(data.last_name_snapshot)}<br>CAPID ${esc(data.capid_snapshot)}</div><div><b>${esc(rankedDrillLabel(data.test_label_snapshot,data.test_code_snapshot))}</b><br>${esc(data.test_topic_snapshot||'')}</div><div><b>${dateText(data.test_date)}</b><br>${data.passed?'PASS':'FAIL'} — ${data.raw_score}/${data.max_score}</div></div><div class="section-title">Testing Officer</div><div>${esc(data.testing_officer_name)}</div>${resultRows?`<div class="section-title">Scoring</div><div class="table-wrap"><table class="data-table"><thead><tr><th>#</th><th>Item</th><th>Result</th></tr></thead><tbody>${resultRows}</tbody></table></div>`:''}${data.notes?`<div class="section-title">Notes</div><div>${esc(data.notes)}</div>`:''}`,`${canEdit?`<button class="btn btn-primary" onclick="editRecord('${id}')">Edit Record</button>`:''}<button class="btn btn-secondary" onclick="closeModal()">Close</button>`);
   }catch(e){err(e)}
 }
 async function editRecord(id){
